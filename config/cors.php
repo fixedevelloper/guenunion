@@ -8,5 +8,5 @@ return [
     'allowed_headers' => ['*'],
     'exposed_headers' => [],
     'max_age' => 0,
-    'supports_credentials' => true, // Indispensable pour Sanctum !
+    'supports_credentials' => false, // Indispensable pour Sanctum !
 ];
