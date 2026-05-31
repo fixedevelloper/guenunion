@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\FeesTableController;
 use App\Http\Controllers\Api\RemittanceController;
 use App\Http\Controllers\Api\ReportingController;
 use App\Http\Controllers\Api\StaffController;
+use App\Http\Controllers\Api\TransferController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -58,6 +59,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/customers', [CustomerController::class, 'index']);
         Route::post('/customers', [CustomerController::class, 'store']);
         Route::get('/customers/{uuid}', [CustomerController::class, 'show']);
+        Route::get('/customers/reference/{reference}', [CustomerController::class, 'searchByReference']);
 
         // Gestion de la Caisse (Sessions et Historiques)
         Route::get('/cashier/session-status', [CashierSessionController::class, 'getSessionStatus']);
@@ -74,6 +76,10 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/remittance/payout', [RemittanceController::class, 'payout']);
         Route::get('/remittance/payout/search', [RemittanceController::class, 'searchPayout']);
         Route::get('/remittance/payout/{reference}', [RemittanceController::class, 'show']);
+
+        ///transfer
+        Route::get('cash/transfer/fees/calculate', [TransferController::class, 'calculateFees']);
+        Route::post('/cash/transfer/execute', [TransferController::class, 'execute']);
     });
 
     /*

@@ -221,9 +221,18 @@ return new class extends Migration
             $table->uuid('uuid')->unique();
             $table->string('reference')->unique();
             $table->enum('type', [
-                'transfer', 'cash_in', 'cash_out', 'deposit', 'withdrawal',
-                'remittance', 'merchant_payment', 'bill_payment', 'peer_to_peer',
-                'commission', 'adjustment', 'refund'
+                'transfer',
+                'cash_in',
+                'cash_out',
+                'deposit',
+                'withdrawal',
+                'remittance',
+                'merchant_payment',
+                'bill_payment',
+                'peer_to_peer',
+                'commission',
+                'adjustment',
+                'refund'
             ]);
             $table->enum('status', ['initiated', 'processing', 'completed', 'paid', 'failed', 'reversed', 'cancelled'])->default('initiated');
             $table->decimal('amount', 18, 2);

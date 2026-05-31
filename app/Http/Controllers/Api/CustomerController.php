@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Customer;
+use App\Models\Transaction;
 use App\Models\User;
 use App\Models\Staff;
 use Exception;
@@ -186,6 +187,8 @@ class CustomerController extends Controller
 
     /**
      * CONSULTER LA FICHE CLIENT ET SON HISTORIQUE DE TRANSACTIONS.
+     * @param string $uuid
+     * @return JsonResponse
      */
     public function show(string $uuid): JsonResponse
     {
@@ -204,7 +207,7 @@ class CustomerController extends Controller
             }
 
             // Récupération des transactions du grand livre liées à ce client
-            $transactions = \App\Models\Transaction::where('sender_customer_id', $customer->id)
+            $transactions = Transaction::where('sender_customer_id', $customer->id)
                 ->orderBy('created_at', 'desc')
                 ->paginate(10);
 
@@ -243,9 +246,66 @@ class CustomerController extends Controller
             ], 404);
         }
     }
+    public function searchByReference(string $reference): JsonResponse
+    {
+        $customer = Customer::query()
+            ->with('user:id,first_name,last_name,phone_number,email')
+            ->where('reference', $reference)
+            ->first();
+
+        if (!$customer) {
+            return response()->json(['success' => false, 'message' => 'Client introuvable.'], 404);
+        }
+
+        // Vérification de sécurité métier
+        if ($customer->status !== 'active') {
+            return response()->json([
+                'success' => false,
+                'message' => "Ce compte est {$customer->status} et ne peut effectuer d'opérations."
+            ], 403);
+        }
+
+        if ($customer->kyc_status !== 'approved') {
+          /*  return response()->json([
+                'success' => false,
+                'message' => "Le compte nécessite une validation KYC complète."
+            ], 403);*/
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'id' => $customer->id,
+                'uuid' => $customer->uuid,
+                'reference' => $customer->reference,
+
+                'first_name' => $customer->user?->first_name,
+            'last_name' => $customer->user?->last_name,
+            'full_name' => trim(
+        ($customer->user?->first_name ?? '') . ' ' .
+    ($customer->user?->last_name ?? '')
+            ),
+
+            'phone_number' => $customer->user?->phone_number,
+            'email' => $customer->user?->email,
+
+            'id_type' => $customer->id_type,
+            'id_number' => $customer->id_number,
+            'id_expiry_date' => $customer->id_expiry_date,
+
+            'kyc_level' => $customer->kyc_level,
+            'kyc_status' => $customer->kyc_status,
+            'status' => $customer->status,
+
+            'created_at' => $customer->created_at?->toIso8601String(),
+        ]
+    ]);
+}
 
     /**
      * HISTORIQUE DES DEMANDES DE VÉRIFICATION KYC (Back-office Conformité).
+     * @param Request $request
+     * @return JsonResponse
      */
     public function kycSubmissions(Request $request): JsonResponse
     {
@@ -296,6 +356,9 @@ class CustomerController extends Controller
 
     /**
      * EVALUER UN DOSSIER DE CONFORMITÉ KYC (Approuver / Rejeter).
+     * @param Request $request
+     * @param string $uuid
+     * @return JsonResponse
      */
     public function evaluateKyc(Request $request, string $uuid): JsonResponse
     {
