@@ -249,7 +249,13 @@ class CustomerController extends Controller
     public function searchByReference(string $reference): JsonResponse
     {
         $customer = Customer::query()
-            ->with('user:id,first_name,last_name,phone_number,email')
+            // Chargement du user ET du wallet principal actif
+            ->with([
+                'user',
+                'mainWallet' => function ($query) {
+                    $query->where('is_active', true);
+                }
+            ])
             ->where('reference', $reference)
             ->first();
 
@@ -266,7 +272,7 @@ class CustomerController extends Controller
         }
 
         if ($customer->kyc_status !== 'approved') {
-          /*  return response()->json([
+      /*      return response()->json([
                 'success' => false,
                 'message' => "Le compte nécessite une validation KYC complète."
             ], 403);*/
@@ -275,29 +281,32 @@ class CustomerController extends Controller
         return response()->json([
             'success' => true,
             'data' => [
-                'id' => $customer->id,
-                'uuid' => $customer->uuid,
-                'reference' => $customer->reference,
-
-                'first_name' => $customer->user?->first_name,
-            'last_name' => $customer->user?->last_name,
-            'full_name' => trim(
-        ($customer->user?->first_name ?? '') . ' ' .
-    ($customer->user?->last_name ?? '')
-            ),
-
-            'phone_number' => $customer->user?->phone_number,
-            'email' => $customer->user?->email,
-
-            'id_type' => $customer->id_type,
-            'id_number' => $customer->id_number,
+                'id'             => $customer->id,
+                'uuid'           => $customer->uuid,
+                'reference'      => $customer->reference,
+                'first_name'     => $customer->user?->first_name,
+            'last_name'      => $customer->user?->last_name,
+            'full_name'      => trim(($customer->user?->first_name ?? '') . ' ' . ($customer->user?->last_name ?? '')),
+            'phone_number'   => $customer->user?->phone_number,
+            'email'          => $customer->user?->email,
+            'id_type'        => $customer->id_type,
+            'id_number'      => $customer->id_number,
             'id_expiry_date' => $customer->id_expiry_date,
+            'kyc_level'      => $customer->kyc_level,
+            'kyc_status'     => $customer->kyc_status,
+            'status'         => $customer->status,
+            'created_at'     => $customer->created_at?->toIso8601String(),
 
-            'kyc_level' => $customer->kyc_level,
-            'kyc_status' => $customer->kyc_status,
-            'status' => $customer->status,
-
-            'created_at' => $customer->created_at?->toIso8601String(),
+            // AJOUT : Bloc d'informations sur le Wallet
+            'wallet' => $customer->mainWallet ? [
+        'uuid'          => $customer->mainWallet->uuid,
+        'wallet_number' => $customer->mainWallet->wallet_number,
+        'type'          => $customer->mainWallet->type,
+        'currency'      => $customer->mainWallet->currency,
+        // Le solde est formaté en float pour éviter les chaînes de caractères brutes en JS
+        'balance'       => (float) $customer->mainWallet->balance,
+        'is_active'     => (bool) $customer->mainWallet->is_active,
+    ] : null // Sécurité si le client n'a pas encore de wallet généré
         ]
     ]);
 }
@@ -307,51 +316,94 @@ class CustomerController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
+    /**
+     * HISTORIQUE DES DEMANDES DE VÉRIFICATION KYC (Back-office Conformité).
+     */
     public function kycSubmissions(Request $request): JsonResponse
     {
-        $user = Auth::user();
-        $staff = Staff::where('user_id', $user->id)->first();
-        $status = $request->input('status', 'pending'); // pending, approved, rejected
+        try {
+            $user = Auth::user();
+            $staff = Staff::where('user_id', $user->id)->first();
+            $status = $request->input('status', 'pending');
 
-        $query = Customer::with(['user', 'kycDocument' => function($q) {
-            $q->with('verifiedByUser:id,first_name,last_name');
-        }])
-            ->where('kyc_status', $status);
+            // 1. On utilise le pluriel 'kycDocuments' et on trie par ID décroissant
+            // pour avoir le document le plus récent en premier
+            $query = Customer::with(['user', 'kycDocuments' => function($q) {
+                $q->orderByDesc('id')->with('verifiedByUser:id,first_name,last_name');
+            }])->where('kyc_status', $status);
 
-        // Restriction de périmètre géographique pour les contrôleurs nationaux (Compliance)
-        if ($user->hasRole('country_admin') && $staff) {
-            $query->where('country_id', $staff->country_id);
-        }
+            if ($user->hasRole('country_admin') && $staff) {
+                $query->where('country_id', $staff->country_id);
+            }
 
-        // Recherche textuelle multicritère sur l'utilisateur ou la référence
-        if ($request->filled('search')) {
-            $search = $request->search;
-            $query->where(function ($q) use ($search) {
-                $q->where('reference', 'LIKE', "%{$search}%")
-                    ->orWhereHas('user', function($uQ) use ($search) {
-                        $uQ->where('first_name', 'LIKE', "%{$search}%")
-                            ->orWhere('last_name', 'LIKE', "%{$search}%")
-                            ->orWhere('phone_number', 'LIKE', "%{$search}%");
-                    });
+            if ($request->filled('search')) {
+                $search = trim($request->search);
+                $query->where(function ($q) use ($search) {
+                    $q->where('reference', 'LIKE', "%{$search}%")
+                        ->orWhereHas('user', function($uQ) use ($search) {
+                            $uQ->where('first_name', 'LIKE', "%{$search}%")
+                                ->orWhere('last_name', 'LIKE', "%{$search}%")
+                                ->orWhere('phone_number', 'LIKE', "%{$search}%");
+                        });
+                });
+            }
+
+            $perPage = (int) $request->input('per_page', 15);
+            $customers = $query->orderByDesc('updated_at')->paginate($perPage);
+
+            $formattedData = collect($customers->items())->map(function ($customer) {
+                // 2. On récupère le document actif (le plus récent soumis)
+                $lastDoc = $customer->kycDocuments->first();
+
+                return [
+                    'id'            => $customer->id,
+                    'reference'     => $customer->reference,
+                    'kyc_status'    => $customer->kyc_status,
+                    'updated_at'    => $customer->updated_at->toIso8601String(),
+                    'customer_info' => $customer->user ? [
+                        'full_name'    => $customer->user->first_name . ' ' . $customer->user->last_name,
+                        'phone_number' => $customer->user->phone_number,
+                        'email'        => $customer->user->email,
+                    ] : null,
+                    // 3. On extrait les données du dernier document s'il existe
+                    'document' => $lastDoc ? [
+                        'uuid'            => $lastDoc->uuid,
+                        'type'            => $lastDoc->type,
+                        'document_number' => $lastDoc->document_number,
+                        'front_image_url' => $lastDoc->front_image ? asset('storage/' . $lastDoc->front_image) : null,
+                        'back_image_url'  => $lastDoc->back_image ? asset('storage/' . $lastDoc->back_image) : null,
+                        'verified_at'     => $lastDoc->verified_at ? $lastDoc->verified_at->toIso8601String() : null,
+                        'verifier'        => $lastDoc->verifiedByUser ? [
+                            'full_name' => $lastDoc->verifiedByUser->first_name . ' ' . $lastDoc->verifiedByUser->last_name
+                        ] : null,
+                    ] : null,
+                    // Optionnel : On renvoie le compte total de documents soumis dans l'historique du client
+                    'total_documents_submitted' => $customer->kycDocuments->count()
+                ];
             });
+
+            $countQuery = Customer::where('kyc_status', 'pending');
+            if ($user->hasRole('country_admin') && $staff) {
+                $countQuery->where('country_id', $staff->country_id);
+            }
+            $pendingCount = $countQuery->count();
+
+            return response()->json([
+                'success' => true,
+                'data'    => $formattedData,
+                'meta'    => [
+                    'pending_count' => $pendingCount,
+                    'pagination' => [
+                        'current_page' => $customers->currentPage(),
+                        'last_page'    => $customers->lastPage(),
+                        'total'        => $customers->total(),
+                    ]
+                ]
+            ], 200);
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
         }
-
-        $query->orderByDesc('updated_at');
-
-        // Compteurs d'alertes dynamiques pour l'UI Next.js (Badges de notification)
-        $countQuery = Customer::where('kyc_status', 'pending');
-        if ($user->hasRole('country_admin') && $staff) {
-            $countQuery->where('country_id', $staff->country_id);
-        }
-        $pendingCount = $countQuery->count();
-
-        return response()->json([
-            'success' => true,
-            'data'    => $query->get(),
-            'meta'    => [
-                'pending_count' => $pendingCount
-            ]
-        ], 200);
     }
 
     /**

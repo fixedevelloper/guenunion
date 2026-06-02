@@ -5,30 +5,38 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Agency;
 use App\Models\CashOperation;
+use App\Models\Commission;
+use App\Models\FraudCheck;
+use App\Models\LoginHistory;
+use App\Models\SystemAuditLog;
 use App\Models\Till;
 use App\Models\Transaction;
 use App\Models\TransactionEntry;
 use App\Models\Wallet;
 use App\Models\Staff;
+use App\Services\FraudCheckService;
 use App\Services\Reporting\ReportingService;
 use Carbon\Carbon;
 use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class ReportingController extends Controller
 {
     protected ReportingService $reportingService;
+    protected $fraudService;
 
     /**
      * Injection du service de reporting global.
      */
-    public function __construct(ReportingService $reportingService)
+    public function __construct(ReportingService $reportingService,FraudCheckService $fraudCheckService)
     {
         $this->reportingService = $reportingService;
+        $this->fraudService=$fraudCheckService;
     }
 
     /**
@@ -230,6 +238,7 @@ class ReportingController extends Controller
     /**
      * DASHBOARD COMPTABILITÉ & SUIVI RÉGIONAL (Pour les Country Admins)
      */
+
     public function getRegionalMetrics(): JsonResponse
     {
         $user = Auth::user();
@@ -242,74 +251,107 @@ class ReportingController extends Controller
             ], 403);
         }
 
-        // 2. Extraction du pays géré depuis le profil Staff
+        // 2. Extraction de la juridiction nationale assignée
         $staff = Staff::with(['country'])->where('user_id', $user->id)->first();
         $country = $staff?->country;
 
-        if (!$country) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Aucune juridiction nationale assignée à votre profil.'
-            ], 403);
-        }
-
-        // 3. Collecte du périmètre des agences nationales
-        $agencies = Agency::where('country_id', $country->id)->get();
-        $agencyIds = $agencies->pluck('id');
-
-        // 4. Calculs des indicateurs macro-économiques (Cash et Guichets)
-        $totalCash = Till::whereIn('agency_id', $agencyIds)->where('is_active', true)->sum('current_balance');
-        $activeTillsCount = Till::whereIn('agency_id', $agencyIds)->where('is_active', true)->count();
-
-        $openTillsCount = 0;
-        $agenciesSummary = [];
-
-        foreach ($agencies as $agency) {
-            $tills = Till::where('agency_id', $agency->id)->where('is_active', true)->get();
-            $agencyOpenTills = 0;
-            $agencyBalance = 0.00;
-
-            foreach ($tills as $till) {
-                $agencyBalance += (float) $till->current_balance;
-
-                // Statut opérationnel immédiat en direct du guichet
-                $lastOp = CashOperation::where('till_id', $till->id)
-                    ->whereIn('type', ['opening', 'closing'])
-                    ->orderByDesc('created_at')
-                    ->first();
-
-                if ($lastOp && $lastOp->type === 'opening') {
-                    $agencyOpenTills++;
-                    $openTillsCount++;
-                }
-            }
-
-            $agenciesSummary[] = [
-                'id'                   => $agency->id,
-                'name'                 => $agency->name,
-                'code'                 => $agency->code ?? 'AG-' . $agency->id,
-                'total_tills'          => $tills->count(),
-                'open_tills'           => $agencyOpenTills,
-                'consolidated_balance' => $agencyBalance,
-            ];
-        }
-
+    if (!$country) {
         return response()->json([
-            'success' => true,
-            'data' => [
-                'region_name'        => $country->name,
-                'total_cash'         => (float) $totalCash,
-                'active_tills_count' => $activeTillsCount,
-                'open_tills_count'   => $openTillsCount,
-                'agencies_count'     => $agencies->count(),
-                'currency'           => $country->currency_code ?? 'XAF',
-                'user' => [
-                    'name' => $user->first_name . ' ' . $user->last_name
-                ],
-                'agencies_summary'   => $agenciesSummary
-            ]
-        ], 200);
+            'success' => false,
+            'message' => 'Aucune juridiction nationale assignée à votre profil.'
+        ], 403);
     }
+
+    // 3. Récupération de la Trésorerie Globale du Pays (Corrigé précédemment)
+    $totalWalletBalance = Wallet::where('owner_type', Agency::class)
+        ->where('type', 'main')
+        ->where('is_active', true)
+        ->whereHasMorph('owner', [Agency::class], function ($query) use ($country) {
+            $query->where('country_id', $country->id);
+        })
+        ->sum('balance');
+
+    $totalPhysicalCash = Till::where('is_active', true)
+        ->whereHas('agency', function ($query) use ($country) {
+            $query->where('country_id', $country->id);
+        })
+        ->sum('current_balance');
+
+    // 4. ✅ CHARGEMENT EN MASSE OPTIMISÉ ET SÉCURISÉ (Clés explicites)
+    $agencies = Agency::where('country_id', $country->id)
+        ->with([
+            'wallets' => function ($query) {
+                $query->where('type', 'main')->where('is_active', true);
+            },
+            'tills' => function ($query) {
+                $query->where('is_active', true);
+            }
+        ])
+        ->withCount([
+            // ✅ Forçage explicite de la clé 'agency_id' pour contourner le bug de détection
+            'tills as total_tills_count' => function ($query) {
+                $query->whereRaw('tills.agency_id = agencies.id');
+            },
+            // Compte les guichets ouverts en vérifiant la dernière opération de caisse
+            'tills as open_tills_count' => function ($query) {
+                $query->whereRaw('tills.agency_id = agencies.id')
+                    ->where('tills.is_active', true)
+                    ->whereHas('operations', function ($subQuery) {
+                        // Utilisation d'un alias ou d'une sous-requête propre pour MySQL
+                        $subQuery->whereRaw('cash_operations.id in (select max(co.id) from cash_operations co group by co.till_id)')
+                            ->where('cash_operations.type', 'opening');
+                    });
+            }
+        ])
+        // Calcule la somme physique des guichets directement en SQL (clé 'agency_id' forcée)
+        ->withSum(['tills as total_till_cash' => function ($query) {
+            $query->whereRaw('tills.agency_id = agencies.id')->where('tills.is_active', true);
+        }], 'current_balance')
+        ->get();
+
+    // 5. Structuration du tableau de synthèse des agences
+    $agenciesSummary = [];
+    $totalOpenTillsNetwork = 0;
+    $totalActiveTillsNetwork = 0;
+
+    foreach ($agencies as $agency) {
+        $mainWallet = $agency->wallets->first();
+        $walletBalance = $mainWallet ? (float) $mainWallet->balance : 0.00;
+
+        $totalOpenTillsNetwork += $agency->open_tills_count;
+        $totalActiveTillsNetwork += $agency->total_tills_count;
+
+        $agenciesSummary[] = [
+            'id'                   => $agency->id,
+            'name'                 => $agency->name,
+            'code'                 => $agency->code ?? 'AG-' . $agency->id,
+            'total_tills'          => (int) $agency->total_tills_count,
+            'open_tills'           => (int) $agency->open_tills_count,
+            'wallet_balance'       => $walletBalance,
+            'vault_cash'           => (float) ($agency->total_till_cash ?? 0),
+            'consolidated_balance' => $walletBalance + (float) ($agency->total_till_cash ?? 0),
+            'status'               => $agency->status ?? 'active'
+        ];
+    }
+
+    // 6. Réponse unifiée pour le Front-end
+    return response()->json([
+        'success' => true,
+        'data' => [
+            'region_name'          => $country->name,
+            'total_wallet_balance' => (float) $totalWalletBalance,
+            'total_physical_cash'  => (float) $totalPhysicalCash,
+            'active_tills_count'   => $totalActiveTillsNetwork,
+            'open_tills_count'     => $totalOpenTillsNetwork,
+            'agencies_count'       => $agencies->count(),
+            'currency'             => $country->currency_code ?? 'XAF',
+            'user' => [
+                'name' => trim($user->first_name . ' ' . $user->last_name)
+            ],
+            'agencies_summary'     => $agenciesSummary
+        ]
+    ], 200);
+}
     /**
      * Obtenir les indicateurs de performance des agences pour l'administrateur connecté.
      */
@@ -614,5 +656,372 @@ class ReportingController extends Controller
                 'message' => "Erreur lors de l'extraction de l'annuaire des équipes : " . $e->getMessage()
             ], 500);
         }
+    }
+
+
+    /**
+     * Récupère l'historique complet des contrôles anti-fraude (Table fraud_checks)
+     * Filtrable par statut de blocage, niveau de risque et recherche textuelle.
+     */
+    public function fraudCheckHistory(Request $request): JsonResponse
+    {
+        try {
+            // 1. Initialisation de la requête avec les relations indispensables
+            $query = FraudCheck::query()->with([
+                'transaction:id,reference,type,status,amount,currency,sender_name,recipient_name'
+            ]);
+
+            // 2. FILTRE : Par indicateur de vigilance (is_flagged)
+            if ($request->filled('is_flagged')) {
+                $query->where('is_flagged', $request->boolean('is_flagged'));
+            }
+
+            // 3. FILTRE : Par sévérité de score (ex: ?risk_level=high)
+            if ($request->filled('risk_level')) {
+                switch ($request->risk_level) {
+                    case 'high':   $query->where('risk_score', '>=', 80); break;
+                    case 'medium': $query->whereBetween('risk_score', [40, 79]); break;
+                    case 'low':    $query->where('risk_score', '<', 40); break;
+                }
+            }
+
+            // 4. RECHERCHE TEXTUELLE MUTLICRITÈRE (Référence ou Motif de fraude)
+            if ($request->filled('search')) {
+                $search = trim($request->search);
+                $query->where(function ($q) use ($search) {
+                    $q->where('reason', 'LIKE', "%{$search}%")
+                        ->orWhereHas('transaction', function ($trxQuery) use ($search) {
+                            $trxQuery->where('reference', 'LIKE', "%{$search}%")
+                                ->orWhere('sender_name', 'LIKE', "%{$search}%")
+                                ->orWhere('recipient_name', 'LIKE', "%{$search}%");
+                        });
+                });
+            }
+
+            // 5. PAGINATION ET TRI (Du plus récent au plus ancien)
+            $perPage = (int) $request->input('per_page', 15);
+            $checks = $query->orderByDesc('created_at')->paginate($perPage);
+
+            // 6. NORMALISATION DES DONNÉES POUR L'UI NEXT.JS
+            $formattedData = collect($checks->items())->map(function ($check) {
+                // Déduction dynamique d'un badge de sévérité pour l'UI
+                $severity = 'low';
+                if ($check->risk_score >= 80) {
+                    $severity = 'critical';
+                } elseif ($check->risk_score >= 40) {
+                    $severity = 'medium';
+                }
+
+                return [
+                    'id'            => $check->id,
+                    'uuid'          => $check->uuid,
+                    'risk_score'    => (int) $check->risk_score,
+                    'severity'      => $severity,
+                    'is_flagged'    => (bool) $check->is_flagged,
+                    'is_blocked'    => $check->risk_score >= 80, // Bloqué si score >= 80 selon vos règles
+                    'reason'        => $check->reason,
+                    'date'          => $check->created_at->toIso8601String(),
+                    'transaction'   => $check->transaction ? [
+                        'id'             => $check->transaction->id,
+                        'reference'      => $check->transaction->reference,
+                        'type'           => $check->transaction->type,
+                        'status'         => $check->transaction->status,
+                        'amount'         => (float) $check->transaction->amount,
+                        'currency'       => $check->transaction->currency,
+                        'sender_name'    => $check->transaction->sender_name,
+                        'recipient_name' => $check->transaction->recipient_name,
+                    ] : null,
+                ];
+            });
+
+            // 7. ENVOI DE LA RÉPONSE STRUCTURÉE
+            return response()->json([
+                'success' => true,
+                'message' => 'Registres de contrôle anti-fraude récupérés avec succès.',
+                'data'    => $formattedData,
+                'pagination' => [
+                    'current_page' => $checks->currentPage(),
+                    'last_page'    => $checks->lastPage(),
+                    'total'        => $checks->total(),
+                    'per_page'     => $checks->perPage(),
+                ]
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur lors de la récupération des fraud_checks : " . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => "Une erreur technique est survenue lors de l'extraction des données de conformité."
+            ], 500);
+        }
+    }
+    /**
+     * Récupère l'historique des événements et audits système.
+     */
+    public function systemeLogs(Request $request): JsonResponse
+    {
+        try {
+            $query = SystemAuditLog::query()->with(['user:id,username,first_name,last_name', 'agency:id,name']);
+
+            // 1. FILTRE : Par sévérité (info, warning, critical)
+            if ($request->filled('severity')) {
+                $query->where('severity', $request->severity);
+            }
+
+            // 2. FILTRE : Par type d'événement (ex: REMITTANCE.INITIATED)
+            if ($request->filled('event_type')) {
+                $query->where('event_type', $request->event_type);
+            }
+
+            // 3. RECHERCHE TEXTUELLE MUTLICRITÈRE (Message, IP, Code Employé)
+            if ($request->filled('search')) {
+                $search = trim($request->search);
+                $query->where(function ($q) use ($search) {
+                    $q->where('message', 'LIKE', "%{$search}%")
+                        ->orWhere('ip_address', 'LIKE', "%{$search}%")
+                        ->orWhere('event_type', 'LIKE', "%{$search}%");
+                });
+            }
+
+            // 4. PAGINATION AUTOMATIQUE
+            $perPage = (int) $request->input('per_page', 20);
+            $logs = $query->orderByDesc('created_at')->paginate($perPage);
+
+            // 5. NORMALISATION POUR NEXT.JS
+            $formattedLogs = collect($logs->items())->map(function ($log) {
+                return [
+                    'id'          => $log->id,
+                    'event_type'  => $log->event_type,
+                    'severity'    => $log->severity,
+                    'message'     => $log->message,
+                    'ip_address'  => $log->ip_address,
+                    'user_agent'  => $log->user_agent,
+                    'payload'     => $log->payload, // Les métadonnées JSON de l'action
+                    'date'        => $log->created_at->toIso8601String(),
+                    'operator'    => $log->user ? [
+                        'username'   => $log->user->username,
+                        'full_name'  => $log->user->first_name . ' ' . $log->user->last_name,
+                    ] : null,
+                    'agency_name' => $log->agency?->name ?? 'Système Central',
+                ];
+            });
+
+            return response()->json([
+                'success'    => true,
+                'data'       => $formattedLogs,
+                'pagination' => [
+                    'current_page' => $logs->currentPage(),
+                    'last_page'    => $logs->lastPage(),
+                    'total'        => $logs->total(),
+                ]
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur extraction Logs Système : " . $e->getMessage());
+            return response()->json(['success' => false, 'message' => "Erreur serveur."], 500);
+        }
+    }
+
+    /**
+     * Liste l'historique des tentatives de connexion à la plateforme.
+     */
+
+    public function historyLogs(Request $request): JsonResponse
+    {
+        try {
+            // 1. Initialisation de la requête avec la relation User pour éviter le problème N+1
+            $query = LoginHistory::query()->with(['user:id,first_name,last_name,username']);
+
+            // 2. FILTRE : Statut (success, failed, etc.)
+            if ($request->filled('status')) {
+                $query->where('status', $request->status);
+            }
+
+            // 3. RECHERCHE TEXTUELLE MULTICRITÈRE (Téléphone tenté, IP, ou nom de l'utilisateur résolu)
+            if ($request->filled('search')) {
+                $search = trim($request->search);
+                $query->where(function ($q) use ($search) {
+                    $q->where('phone_attempted', 'LIKE', "%{$search}%")
+                        ->orWhere('ip_address', 'LIKE', "%{$search}%")
+                        ->orWhere('user_agent', 'LIKE', "%{$search}%")
+                        ->orWhereHas('user', function ($userQuery) use ($search) {
+                            $userQuery->where('username', 'LIKE', "%{$search}%")
+                                ->orWhere('first_name', 'LIKE', "%{$search}%")
+                                ->orWhere('last_name', 'LIKE', "%{$search}%");
+                        });
+                });
+            }
+
+            // 4. PAGINATION ET TRI (Utilisation de created_at décroissant comme configuré dans votre modèle)
+            $perPage = (int) $request->input('per_page', 20);
+            $logs = $query->orderByDesc('created_at')->paginate($perPage);
+
+            // 5. MAPPING ET NORMALISATION DES DONNÉES POUR L'UI NEXT.JS
+            $formattedLogs = collect($logs->items())->map(function ($log) {
+                return [
+                    'id'              => $log->id,
+                    'phone_attempted' => $log->phone_attempted,
+                    'ip_address'      => $log->ip_address,
+                    'status'          => $log->status,
+                    'failure_reason'  => $log->failure_reason,
+                    'user_agent'      => $log->user_agent,
+                    'date'            => $log->created_at ? $log->created_at->toIso8601String() : null,
+                    'logged_out_at'   => $log->logged_out_at ? $log->logged_out_at->toIso8601String() : null,
+                    'user'            => $log->user ? [
+                        'id'         => $log->user->id,
+                        'username'   => $log->user->username,
+                        'full_name'  => $log->user->first_name . ' ' . $log->user->last_name,
+                    ] : null,
+                    'agency_id'       => $log->agency_id, // Utile si vous voulez matcher avec un store d'agences au front
+                ];
+            });
+
+            // 6. ENVOI DE LA RÉPONSE COMPATIBLE
+            return response()->json([
+                'success' => true,
+                'data'    => $formattedLogs,
+                'pagination' => [
+                    'current_page' => $logs->currentPage(),
+                    'last_page'    => $logs->lastPage(),
+                    'total'        => $logs->total(),
+                    'per_page'     => $logs->perPage(),
+                ]
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur d'extraction des Logs de Connexion (LoginHistory) : " . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => "Une erreur technique est survenue lors de la lecture des registres d'accès."
+            ], 500);
+        }
+    }
+
+    /**
+     * Génère les données de prévisualisation en fonction du type de document.
+     */
+    public function previewDocument(Request $request): JsonResponse
+    {
+        $request->validate([
+            'doc_type' => 'required|in:grand_livre,balance_wallets,synthese_retrocessions'
+        ]);
+
+        $docType = $request->doc_type;
+        $data = [];
+
+        switch ($docType) {
+            case 'grand_livre':
+                // 1. Chargement des commissions avec la relation Wallet et son propriétaire polymorphique (owner)
+                $data = Commission::with([
+                    'transaction:id,reference,amount,currency',
+                    'wallet.owner'
+                ])
+                    ->orderByDesc('created_at')
+                    ->limit(10)
+                    ->get()
+                    ->map(function ($com) {
+                        $wallet = $com->wallet;
+                        $displayName = 'Système';
+
+                        // Résolution du nom du propriétaire pour le Grand Livre
+                        if ($wallet && $wallet->owner) {
+                            $owner = $wallet->owner;
+                            if (isset($owner->name)) {
+                                $displayName = $owner->name;
+                            } elseif (isset($owner->first_name) || isset($owner->last_name)) {
+                                $displayName = trim(($owner->first_name ?? '') . ' ' . ($owner->last_name ?? ''));
+                            } else {
+                                $displayName = class_basename($wallet->owner_type) . ' N°' . $wallet->owner_id;
+                            }
+                        }
+
+                        return [
+                            'col1' => $com->created_at->format('d/m/Y H:i'),
+                            'col2' => $com->transaction?->reference ?? 'N/A',
+                'col3' => $displayName . ($wallet ? " ({$wallet->wallet_number})" : ""),
+                'col4' => number_format($com->transaction?->amount ?? 0) . ' ' . ($com->transaction?->currency ?? 'XAF'),
+                'col5' => number_format($com->amount) . ' ' . ($com->transaction?->currency ?? 'XAF'),
+            ];
+        });
+
+                $headers = ['Date/Heure', 'Réf. Transaction', 'Compte Affecté (Titulaire)', 'Volume Principal', 'Commission'];
+                break;
+
+            case 'balance_wallets':
+                // 1. Calcul des cumuls financiers groupés par wallet_id
+                $rawData = Commission::select(
+                    'wallet_id',
+                    DB::raw('SUM(amount) as total_commissions'),
+                    DB::raw('COUNT(id) as count_operations')
+                )
+                    ->groupBy('wallet_id')
+                    ->orderByDesc('total_commissions')
+                    ->limit(10)
+                    ->get();
+
+                // 2. Chargement optimisé de la relation polymorphique pour éviter le problème N+1
+                $rawData->load(['wallet.owner']);
+
+                // 3. Normalisation et formatage pour l'interface Next.js
+                $data = $rawData->map(function ($row) {
+                    $wallet = $row->wallet;
+                    $displayName = 'Compte Inconnu';
+
+                    if ($wallet && $wallet->owner) {
+                        $owner = $wallet->owner;
+
+                        if (isset($owner->name)) {
+                            $displayName = $owner->name;
+                        } elseif (isset($owner->first_name) || isset($owner->last_name)) {
+                            $displayName = trim(($owner->first_name ?? '') . ' ' . ($owner->last_name ?? ''));
+                        } else {
+                            $displayName = class_basename($wallet->owner_type) . ' N°' . $wallet->owner_id;
+                        }
+                    }
+
+                    return [
+                        'col1' => $displayName,
+                        'col2' => $row->count_operations . ' transaction(s)',
+                        'col3' => $wallet ? $wallet->wallet_number : 'N/A',
+                        'col4' => $wallet ? strtoupper($wallet->type) : 'N/A',
+                        'col5' => number_format($row->total_commissions) . ' ' . ($wallet->currency ?? 'XAF'),
+                    ];
+                });
+
+                $headers = ['Titulaire (Owner)', 'Activité', 'Numéro de Compte', 'Type de Wallet', 'Solde Commissions'];
+                break;
+
+            case 'synthese_retrocessions':
+                // Analyse par taux appliqué (Rapprochement analytique)
+                $data = Commission::select(
+                    'percentage',
+                    DB::raw('SUM(amount) as volume_gagne'),
+                    DB::raw('AVG(amount) as moyenne')
+                )
+                    ->groupBy('percentage')
+                    ->orderByDesc('percentage')
+                    ->get()
+                    ->map(function ($row) {
+                        return [
+                            'col1' => "Règle tarifaire à " . $row->percentage . "%",
+                            'col2' => 'N/A',
+                            'col3' => 'N/A',
+                            'col4' => 'Moyenne : ' . number_format($row->moyenne, 2) . ' XAF',
+                            'col5' => number_format($row->volume_gagne) . ' XAF',
+                        ];
+                    });
+
+                $headers = ['Clé de Répartition', '', '', 'Indicateur Moyen', 'Total Collecté'];
+                break;
+        }
+
+        return response()->json([
+            'success' => true,
+            'headers' => $headers,
+            'rows'    => $data
+        ]);
     }
 }

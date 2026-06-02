@@ -97,6 +97,7 @@ class StaffController extends Controller
      */
     public function store(Request $request): JsonResponse
     {
+        logger($request->all());
         // 1. Validation stricte des données reçues de Next.js
         $validated = $request->validate([
             'first_name'    => 'required|string|max:100',

@@ -7,7 +7,7 @@ use Illuminate\Support\Str;
 
 class TransactionEntry extends Model
 {
-    // Pas de SoftDeletes ici ! Le Grand Livre ne doit jamais effacer de données.
+
 
     protected $fillable = [
         'uuid', 'transaction_id', 'wallet_id', 'entry_type', 'amount', 'balance_before', 'balance_after', 'row_signature'

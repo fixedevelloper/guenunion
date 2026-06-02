@@ -257,4 +257,61 @@ class AuthController extends Controller
             return response()->json(['success' => false, 'message' => 'Erreur lors de la déconnexion.'], 500);
         }
     }
+    /**
+     * Rafraîchir le jeton d'accès Sanctum pour l'opérateur connecté.
+     */
+    public function refresh(Request $request): JsonResponse
+    {
+        try {
+            $user = $request->user();
+
+            // 1. Double sécurité : On revérifie que l'utilisateur est toujours actif
+            if (!$user->is_active) {
+                return response()->json(['message' => 'Compte suspendu ou inactif.'], 403);
+            }
+
+            // 2. Récupérer le profil Staff et son contexte (Agence / Caisse)
+            $staff = Staff::with(['agency', 'till'])->where('user_id', $user->id)->first();
+
+            if (!$user->hasRole('customer') && (!$staff || !$staff->is_active)) {
+                return response()->json(['message' => 'Profil opérateur non autorisé ou inactif.'], 403);
+            }
+
+            // 3. Révocation du jeton actuel utilisé pour cette requête de rafraîchissement
+            if ($user->currentAccessToken()) {
+                $user->currentAccessToken()->delete();
+            }
+
+            // 4. Génération du nouveau jeton Sanctum
+            $token = $user->createToken('auth_token')->plainTextToken;
+
+            // 5. Retourner la réponse au même format exact que le Login
+            return Helpers::success([
+                'success'      => true,
+                'access_token' => $token,
+                'token_type'   => 'Bearer',
+                'user'         => [
+                    'id'           => $user->id,
+                    'username'     => $user->username,
+                    'first_name'   => $user->first_name,
+                    'last_name'    => $user->last_name,
+                    'roles'        => $user->getRoleNames(),
+                    'permissions'  => $user->getAllPermissions()->pluck('name'),
+                    'context'      => $staff ? [
+                        'staff_id'      => $staff->id,
+                        'employee_code' => $staff->employee_code,
+                        'agency_id'     => $staff->agency_id,
+                        'agency_name'   => $staff->agency?->name,
+                    'till_id'       => $staff->till_id,
+                    'till_name'     => $staff->till?->name,
+                    'country_id'    => $staff->country_id,
+                ] : null
+            ]
+        ], 200);
+
+    } catch (Exception $e) {
+            Log::error("Erreur critique lors du rafraîchissement du jeton : " . $e->getMessage());
+            return response()->json(['success' => false, 'message' => 'Une erreur interne est survenue.'], 500);
+        }
+    }
 }

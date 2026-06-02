@@ -33,10 +33,18 @@ class Customer extends Model
     }
 
     /**
-     * Portefeuilles du client (Principal Mobile Money, Épargne, etc.)
+     * Récupérer tous les wallets du client.
      */
     public function wallets()
     {
         return $this->morphMany(Wallet::class, 'owner');
+    }
+
+    /**
+     * Récupérer spécifiquement le wallet principal (Main Wallet) du client.
+     */
+    public function mainWallet()
+    {
+        return $this->morphOne(Wallet::class, 'owner')->where('type', 'main');
     }
 }

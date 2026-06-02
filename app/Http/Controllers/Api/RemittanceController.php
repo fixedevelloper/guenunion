@@ -10,6 +10,7 @@ use App\Models\TransactionEntry;
 use App\Models\User;
 use App\Models\Wallet;
 use App\Models\Staff;
+use App\Services\FraudCheckService;
 use App\Services\RemittanceService;
 use App\Models\Customer;
 use Exception;
@@ -24,13 +25,15 @@ use Illuminate\Support\Str;
 class RemittanceController extends Controller
 {
     protected RemittanceService $remittanceService;
-
+    protected $fraudService;
     /**
      * Injection du service de gestion des transferts.
+     * @param RemittanceService $remittanceService
      */
-    public function __construct(RemittanceService $remittanceService)
+    public function __construct(RemittanceService $remittanceService,FraudCheckService $fraudCheckService)
     {
         $this->remittanceService = $remittanceService;
+        $this->fraudService=$fraudCheckService;
     }
 
     /**
@@ -189,14 +192,14 @@ class RemittanceController extends Controller
         }
     }
 
+
     /**
-     * ÉTAPE 2 : Initialiser et valider une émission de fonds au guichet (KYC Expéditeur & Destinataire).
-     * @param Request $request
+     * ÉTAPE 2 : Initialiser, analyser contre la fraude et valider une émission de fonds au guichet.
+     * * @param Request $request
      * @return JsonResponse
      */
     public function initiate(Request $request): JsonResponse
     {
-        logger($request->all());
         $validatedData = $request->validate([
             'amount'                 => 'required|numeric|min:100',
             // Infos Expéditeur
@@ -219,112 +222,176 @@ class RemittanceController extends Controller
         try {
             $user = Auth::user();
 
-            // Extraction du profil guichetier/caissier
-            $staff = Staff::with('agency.country')->where('user_id', $user->id)->first();
+            // 1. Extraction et validation du profil de l'opérateur (Guichetier / Caissier)
+            $staff = Staff::with(['agency.country'])->where('user_id', $user->id)->first();
             $sourceAgency = $staff?->agency;
 
-            if (!$sourceAgency) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "Erreur de sécurité : Votre compte utilisateur n'est rattaché à aucune agence ou guichet physique valide."
-                ], 403);
-            }
+        if (!$sourceAgency || !$sourceAgency->country) {
+            return response()->json([
+                'success' => false,
+                'message' => "Erreur de sécurité : Votre compte utilisateur n'est rattaché à aucune agence ou pays valide."
+            ], 403);
+        }
 
-            // Normalisation via helpers locaux
-            $cleanSenderPhone = clean_phone($validatedData['sender_phone']);
-            $idNumberUpper = strtoupper($validatedData['sender_id_number']);
+        // 2. Normalisation des données d'entrée
+        $cleanSenderPhone = clean_phone($validatedData['sender_phone']);
+        $idNumberUpper = strtoupper($validatedData['sender_id_number']);
+        $amount = (float) $validatedData['amount'];
 
-            // Exécution sous isolation transactionnelle ACID
-            $transactionResult = DB::transaction(function () use ($validatedData, $user, $staff, $sourceAgency, $cleanSenderPhone, $idNumberUpper) {
+        // 3. Résolution préliminaire du client pour l'anti-fraude (sans lock à ce stade)
+        $existingCustomer = Customer::where('id_number', $idNumberUpper)->first();
+        $customerId = $existingCustomer?->id;
 
-                // A. Résolution du client par sa pièce unique
-                $senderCustomer = Customer::where('id_number', $idNumberUpper)->first();
+        // 4. CONTRÔLE ANTI-FRAUDE ET AML
+        $fraudAnalysis = $this->fraudService->analyze(
+            'remittance',
+            $customerId,
+            $amount,
+            [
+                'sender_phone' => $cleanSenderPhone,
+                'is_anonymous' => is_null($customerId)
+            ]
+        );
 
-                if (!$senderCustomer) {
-                    $usernameSeed = Str::slug($validatedData['sender_first_name'] . ' ' . $validatedData['sender_last_name']);
-
-                    $customerUser = User::create([
-                        'uuid'         => (string) Str::uuid(),
-                        'username'     => strtolower(substr($usernameSeed, 0, 10) . rand(100, 999)),
-                        'first_name'   => strtoupper($validatedData['sender_first_name']),
-                        'last_name'    => ucwords(strtolower($validatedData['sender_last_name'])),
-                        'phone_number' => $cleanSenderPhone,
-                        'email'        => $validatedData['sender_email'] ?? null,
-                        'password'     => Hash::make('Default@2026'),
-                        'is_active'    => true,
-                    ]);
-
-                    $customerUser->assignRole('auditor');
-
-                    $senderCustomer = Customer::create([
-                        'user_id'        => $customerUser->id,
-                        'reference'      => 'CLI-' . strtoupper(Str::random(8)),
-                        'id_type'        => $validatedData['sender_id_type'],
-                        'id_number'      => $idNumberUpper,
-                        'id_expiry_date' => $validatedData['sender_id_expiry'],
-                        'country_id'     => $sourceAgency->country_id,
-                        'city_id'        => $validatedData['sender_city_id'],
-                        'address'        => $validatedData['sender_address'],
-                        'status'         => 'active',
-                    ]);
-                }
-
-                // Normalisation du numéro destinataire indexé sur l'identifiant pays d'agence
-                $cleanRecipientPhone = format_to_international($validatedData['recipient_phone'], $sourceAgency->country->id ?? '237');
-
-                $transactionData = [
-                    'amount'                 => (float) $validatedData['amount'],
-                    'sender_customer_id'     => $senderCustomer->id,
-                    'sender_name'            => $senderCustomer->user->first_name . ' ' . $senderCustomer->user->last_name,
-                    'sender_phone'           => $senderCustomer->user->phone_number,
-                    'recipient_name'         => $validatedData['recipient_name'],
-                    'recipient_phone'        => $cleanRecipientPhone,
-                    'recipient_email'        => $validatedData['recipient_email'] ?? null,
-                    'destination_country_id' => (int) $validatedData['destination_country_id'],
-                ];
-                logger($sourceAgency);
-                // Injection du profil Staff pour l'imputation financière du guichet
-                return $this->remittanceService->initiateRemittance($staff->user, $sourceAgency, $transactionData);
-            });
-
-            // Journalisation technique de l'audit système via l'ID Staff
+        // Interception si le pare-feu anti-fraude lève un drapeau rouge
+        if ($fraudAnalysis['is_blocked'] || $fraudAnalysis['is_flagged']) {
             SystemAuditLog::create([
                 'user_id'    => $user->id,
                 'agency_id'  => $sourceAgency->id,
-                'event_type' => 'REMITTANCE.INITIATED',
-                'severity'   => 'info',
-                'message'    => "Mandat cash émis avec succès par l'opérateur [{$staff->employee_code}]. Référence : {$transactionResult->reference}",
+                'event_type' => 'REMITTANCE.FRAUD_BLOCK',
+                'severity'   => 'critical',
+                'message'    => "Émission bloquée par la sécurité. Motif : " . $fraudAnalysis['reason'],
                 'payload'    => [
-                    'reference'    => $transactionResult->reference,
-                    'amount'       => (float) $transactionResult->amount,
-                    'recipient'    => $validatedData['recipient_name'],
-                    'staff_id'     => $staff->id
+                    'sender_phone'     => mask_data($cleanSenderPhone, 'phone'), // Fonction fictive de masquage conseillée
+                    'sender_id_number' => mask_data($idNumberUpper, 'id'),
+                    'amount'           => $amount,
+                    'risk_score'       => $fraudAnalysis['risk_score']
                 ],
-                'ip_address' => request()->ip(),
-                'user_agent' => request()->userAgent(),
+                'ip_address' => $request->ip(),
+                'user_agent' => $request->userAgent(),
             ]);
 
             return response()->json([
-                'success' => true,
-                'message' => 'Le mandat cash a été émis et validé avec succès au guichet.',
-                'data'    => [
-                    'reference'       => $transactionResult->reference,
-                    'secure_code'     => $transactionResult->secure_code, // Clé de sécurisation d'encaissement
-                    'amount'          => (float) $transactionResult->amount,
-                    'fees'            => (float) $transactionResult->fees,
-                    'total_paid'      => (float) ($transactionResult->amount + $transactionResult->fees),
-                    'currency'        => $transactionResult->currency,
-                    'sender_name'     => $transactionResult->sender_name,
-                    'recipient_name'  => $transactionResult->recipient_name,
-                    'recipient_email' => $transactionResult->recipient_email,
-                    'created_at'      => $transactionResult->created_at->toIso8601String()
-                ]
-            ], 201);
+                'success' => false,
+                'message' => "Opération refusée pour non-conformité réglementaire (AML) : " . $fraudAnalysis['reason']
+            ], 422);
+        }
 
-        } catch (Exception $e) {
+        // 5. EXÉCUTION DE LA TRANSACTION SOUS ISOLATION STRICTE ACID
+        // Note: Injection de $idNumberUpper pour refaire le check de sécurité interne contre les Race Conditions
+        $transactionResult = DB::transaction(function () use ($validatedData, $user, $staff, $sourceAgency, $cleanSenderPhone, $idNumberUpper) {
+
+            // Sécurisation anti-concurrence : On recherche et verrouille la ligne si elle existe déjà
+            $senderCustomer = Customer::where('id_number', $idNumberUpper)->lockForUpdate()->first();
+
+            // Si le client n'existe toujours pas, on le crée en toute sécurité
+            if (!$senderCustomer) {
+                $usernameSeed = Str::slug($validatedData['sender_first_name'] . ' ' . $validatedData['sender_last_name']);
+
+                // Création du User de base pour le client
+                $customerUser = User::create([
+                    'uuid'         => (string) Str::uuid(),
+                    'username'     => strtolower(substr($usernameSeed, 0, 10) . rand(100, 999)),
+                    'first_name'   => strtoupper($validatedData['sender_first_name']),
+                    'last_name'    => ucwords(strtolower($validatedData['sender_last_name'])),
+                    'phone_number' => $cleanSenderPhone,
+                    'email'        => $validatedData['sender_email'] ?? null,
+                    'password'     => Hash::make(Str::random(16)), // 'Default@2026' est une faille de sécurité, préférez un random ou nul si pas d'accès direct
+                    'is_active'    => true,
+                ]);
+
+                $customerUser->assignRole('customer');
+                $clientReference = 'CLI-' . strtoupper(Str::random(8));
+
+                // Création du profil Customer associé
+                $senderCustomer = Customer::create([
+                    'user_id'        => $customerUser->id,
+                    'reference'      => $clientReference,
+                    'id_type'        => $validatedData['sender_id_type'],
+                    'id_number'      => $idNumberUpper,
+                    'id_expiry_date' => $validatedData['sender_id_expiry'],
+                    'country_id'     => $sourceAgency->country_id,
+                    'city_id'        => $validatedData['sender_city_id'],
+                    'address'        => $validatedData['sender_address'],
+                    'status'         => 'active',
+                    'kyc_status'     => 'approved',
+                ]);
+
+                // Création du portefeuille principal
+                Wallet::create([
+                    'uuid'          => (string) Str::uuid(),
+                    'wallet_number' => 'W-' . $clientReference,
+                    'type'          => 'main',
+                    'currency'      => $sourceAgency->country->currency_code ?? 'XAF',
+                    'balance'       => 0.00,
+                    'is_active'     => true,
+                    'owner_id'      => $senderCustomer->id,
+                    'owner_type'    => Customer::class
+                ]);
+            }
+
+            // Normalisation internationale du numéro du bénéficiaire sécurisée (on est sûr que country existe)
+            $cleanRecipientPhone = format_to_international($validatedData['recipient_phone'], $sourceAgency->country->id);
+
+            $transactionData = [
+                'amount'                 => (float) $validatedData['amount'],
+                'sender_customer_id'     => $senderCustomer->id,
+                'sender_name'            => $senderCustomer->user->first_name . ' ' . $senderCustomer->user->last_name,
+                'sender_phone'           => $senderCustomer->user->phone_number,
+                'recipient_name'         => $validatedData['recipient_name'],
+                'recipient_phone'        => $cleanRecipientPhone,
+                'recipient_email'        => $validatedData['recipient_email'] ?? null,
+                'destination_country_id' => (int) $validatedData['destination_country_id'],
+            ];
+
+            // Appel de la logique comptable d'émission
+            return $this->remittanceService->initiateRemittance($staff->user, $sourceAgency, $transactionData);
+        });
+
+        // 6. ARCHIVAGE IMMUABLE DU CONTRÔLE DE FRAUDE
+        $this->fraudService->logCheck($transactionResult->id, $fraudAnalysis);
+
+        // 7. JOURNALISATION D'AUDIT SYSTÈME
+        SystemAuditLog::create([
+            'user_id'    => $user->id,
+            'agency_id'  => $sourceAgency->id,
+            'event_type' => 'REMITTANCE.INITIATED',
+            'severity'   => 'info',
+            'message'    => "Mandat cash émis avec succès par l'opérateur [{$staff->employee_code}]. Référence : {$transactionResult->reference}",
+            'payload'    => [
+                'reference'  => $transactionResult->reference,
+                'amount'     => (float) $transactionResult->amount,
+                'recipient'  => $validatedData['recipient_name'],
+                'staff_id'   => $staff->id,
+                'risk_score' => $fraudAnalysis['risk_score']
+            ],
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+        ]);
+
+        // 8. RÉPONSE ALIGNÉE AVEC L'UI NEXT.JS
+        return response()->json([
+            'success' => true,
+            'message' => 'Le mandat cash a été émis et validé avec succès au guichet.',
+            'data'    => [
+                'reference'       => $transactionResult->reference,
+                'secure_code'     => $transactionResult->secure_code,
+                'amount'          => (float) $transactionResult->amount,
+                'fees'            => (float) $transactionResult->fees,
+                'total_paid'      => (float) ($transactionResult->amount + $transactionResult->fees + $transactionResult->taxes),
+                'currency'        => $transactionResult->currency,
+                'sender_name'     => $transactionResult->sender_name,
+                'recipient_name'  => $transactionResult->recipient_name,
+                'recipient_email' => $transactionResult->recipient_email,
+                'created_at'      => $transactionResult->created_at->toIso8601String()
+            ]
+        ], 201);
+
+    } catch (Exception $e) {
+            // Nettoyage des logs pour ne pas sauvegarder de données KYC sensibles en clair
             Log::error("Échec lors de l'émission du mandat au guichet : " . $e->getMessage(), [
                 'user_id' => Auth::id(),
-                'payload' => $request->all()
+                'trace'   => $e->getTraceAsString() // Préférable au request->all() brut
             ]);
 
             return response()->json([
@@ -335,7 +402,10 @@ class RemittanceController extends Controller
     }
 
     /**
-     * ÉTAPE 3 : Payer un mandat (Décaissement/Retrait) au bénéficiaire.
+     * ÉTAPE 3 : Valider, analyser contre la fraude et payer un mandat (Décaissement) au bénéficiaire.
+     *
+     * @param Request $request
+     * @return JsonResponse
      */
     public function payout(Request $request): JsonResponse
     {
@@ -351,45 +421,130 @@ class RemittanceController extends Controller
 
         try {
             $user = Auth::user();
-            $staff = Staff::where('user_id', $user->id)->first();
+
+            // 1. Extraction et validation du profil de l'opérateur payeur
+            $staff = Staff::with('agency')->where('user_id', $user->id)->first();
             $destinationAgency = $staff?->agency;
 
-            if (!$destinationAgency) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "Erreur de configuration : Votre session n'est liée à aucune agence distributrice active."
-                ], 403);
+        if (!$destinationAgency) {
+            return response()->json([
+                'success' => false,
+                'message' => "Erreur de configuration : Votre session n'est liée à aucune agence distributrice active."
+            ], 403);
+        }
+
+        // Initialisation de la variable pour la portée globale hors de la transaction DB
+        $fraudAnalysis = null;
+
+        // 2 & 4. ISOLATION ACID ET VERROUILLAGE CONTRE LE DOUBLE DÉCAISSEMENT
+        $transactionResult = DB::transaction(function () use ($validated, $user, $destinationAgency, $staff, &$fraudAnalysis) {
+
+            // Récupération avec VERROU STRICT (lockForUpdate) et validation du statut initial requis
+            $transaction = Transaction::where('reference', trim($validated['reference']))
+                ->where('secure_code', trim($validated['secure_code']))
+                ->lockForUpdate()
+                ->first();
+
+            if (!$transaction) {
+                throw new Exception("Mandat introuvable ou paramètres de sécurité incorrects.", 404);
             }
 
-            // Traitement financier via le service dédié (imputation sur la caisse physique du staff)
-            $transaction = $this->remittanceService->payoutRemittance(
-                $staff->user,
-                $destinationAgency,
-                $validated
+            // Sécurité métier : Le mandat doit impérativement être en attente de paiement
+            // Adaptez 'pending' selon la valeur exacte de votre ENUM / Statut en DB (ex: 'active', 'payable')
+            if ($transaction->status !== 'pending') {
+                throw new Exception("Ce mandat ne peut pas être payé. Statut actuel : [" . strtoupper($transaction->status) . "].", 422);
+            }
+
+            // 3. CONTRÔLE ANTI-FRAUDE & COMPLICITÉ INTERNE (Exécuté au chaud sous le verrou)
+            $fraudAnalysis = $this->fraudService->analyze(
+                'remittance_payout',
+                null,
+                (float) $transaction->amount,
+                [
+                    'transaction' => $transaction,
+                    'payout_staff_id' => $staff->id // Utile pour détecter si l'émetteur == le payeur
+                ]
             );
 
-            return response()->json([
-                'success' => true,
-                'message' => 'Le paiement a été approuvé. Le mandat passe au statut [PAID]. Vous pouvez décaisser les fonds du guichet.',
-                'data'    => [
-                    'reference'   => $transaction->reference,
-                    'paid_amount' => (float) $transaction->amount,
-                    'currency'    => $transaction->currency,
-                    'paid_at'     => $transaction->completed_at ? $transaction->completed_at->toIso8601String() : now()->toIso8601String()
-                ]
-            ], 200);
+            // Si le pare-feu anti-fraude lève un blocage
+            if ($fraudAnalysis['is_blocked'] || $fraudAnalysis['is_flagged']) {
+                throw new Exception("BLOQUÉ_FRAUDE: " . $fraudAnalysis['reason'], 403);
+            }
 
-        } catch (Exception $e) {
-            Log::error("Échec lors du décaissement du mandat au guichet : " . $e->getMessage(), [
-                'user_id'     => Auth::id(),
-                'reference'   => $request->input('reference'),
-                'secure_code' => $request->input('secure_code')
+            // 4. EXÉCUTION DU DÉCAISSEMENT COMPTABLE (Le service doit passer le statut à 'paid')
+            return $this->remittanceService->payoutRemittance(
+                $staff->user,
+                $destinationAgency,
+                array_merge($validated, ['transaction_id' => $transaction->id])
+            );
+        });
+
+        // 5. ARCHIVAGE DU RAPPORT DE RISQUE LIÉ À LA TRANSACTION
+        $this->fraudService->logCheck($transactionResult->id, $fraudAnalysis);
+
+        // Masquage du numéro de pièce d'identité pour la conformité d'audit (RGPD)
+        $maskedIdNumber = substr(trim($validated['recipient_id_number']), 0, 3) . '****' . substr(trim($validated['recipient_id_number']), -3);
+
+        // 6. JOURNALISATION D'AUDIT TECHNIQUE
+        SystemAuditLog::create([
+            'user_id'    => $user->id,
+            'agency_id'  => $destinationAgency->id,
+            'event_type' => 'REMITTANCE.PAID',
+            'severity'   => 'info',
+            'message'    => "Mandat cash payé avec succès à l'agence [{$destinationAgency->name}]. Opérateur : {$staff->employee_code}",
+            'payload'    => [
+                'reference'  => $transactionResult->reference,
+                'amount'     => (float) $transactionResult->amount,
+                'recipient'  => $transactionResult->recipient_name,
+                'staff_id'   => $staff->id,
+                'id_verified'=> strtoupper($validated['recipient_id_type']) . " - " . $maskedIdNumber
+            ],
+            'ip_address' => $request->ip(),
+            'user_agent' => $request->userAgent(),
+        ]);
+
+        // 7. RÉPONSE RETOURNÉE À L'UI NEXT.JS
+        return response()->json([
+            'success' => true,
+            'message' => 'Le paiement a été approuvé. Le mandat passe au statut [PAID]. Vous pouvez décaisser les fonds du guichet.',
+            'data'    => [
+                'reference'   => $transactionResult->reference,
+                'paid_amount' => (float) $transactionResult->amount,
+                'currency'    => $transactionResult->currency,
+                'paid_at'     => $transactionResult->completed_at ? $transactionResult->completed_at->toIso8601String() : now()->toIso8601String()
+            ]
+        ], 200);
+
+    } catch (Exception $e) {
+            // Interception spécifique pour la fraude afin de logguer l'alerte de sécurité
+            if (str_starts_with($e->getMessage(), 'BLOQUÉ_FRAUDE:')) {
+                SystemAuditLog::create([
+                    'user_id'    => Auth::id(),
+                    'agency_id'  => $destinationAgency?->id,
+                'event_type' => 'PAYOUT.FRAUD_BLOCK',
+                'severity'   => 'critical',
+                'message'    => "Tentative de retrait bloquée. " . $e->getMessage(),
+                'payload'    => [
+                    'reference' => $request->input('reference'),
+                ],
+                'ip_address' => $request->ip(),
+                'user_agent' => $request->userAgent(),
             ]);
+        }
+
+            Log::error("Échec lors du décaissement du mandat au guichet : " . $e->getMessage(), [
+                'user_id'   => Auth::id(),
+                'reference' => $request->input('reference')
+            ]);
+
+            // Gestion propre du code HTTP de retour selon l'exception levée
+            $code = in_array($e->getCode(), [403, 404, 422]) ? $e->getCode() : 422;
+            $cleanMessage = str_replace('BLOQUÉ_FRAUDE: ', '', $e->getMessage());
 
             return response()->json([
                 'success' => false,
-                'message' => "Paiement refusé : " . $e->getMessage()
-            ], 422);
+                'message' => "Paiement refusé : " . $cleanMessage
+            ], $code);
         }
     }
 

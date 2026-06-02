@@ -24,7 +24,7 @@ class AgencyTransactionController extends Controller
 
         // Requête de base sur les transactions de l'agence uniquement
         $query = Transaction::where('source_agency_id', $agencyId)
-            ->with(['till', 'cashier']); // Chargement des relations utiles (tiroir et agent)
+            ->with([ 'initiator']); // Chargement des relations utiles (tiroir et agent)
 
         // Filtre par type (cash_in, cash_out)
         if ($request->has('type') && $request->input('type') !== 'all') {
@@ -43,7 +43,7 @@ class AgencyTransactionController extends Controller
                 $q->where('reference', 'like', "%{$search}%")
                     ->orWhere('customer_phone', 'like', "%{$search}%")
                     ->orWhere('customer_name', 'like', "%{$search}%")
-                    ->orWhereHas('till', function($t) use ($search) {
+                    ->orWhereHas('initiator', function($t) use ($search) {
                         $t->where('code', 'like', "%{$search}%");
                     });
             });
@@ -61,10 +61,10 @@ class AgencyTransactionController extends Controller
                 'amount' => (float) $tx->amount,
                 'fees_amount' => (float) ($tx->fees_amount ?? 0),
                 'status' => $tx->status,
-                'customer_name' => $tx->customer_name,
-                'customer_phone' => $tx->customer_phone,
+                'customer_name' => $tx->senderCustomer->first_name,
+                'customer_phone' => $tx->senderCustomer->phone_number,
                 'till_code' => $tx->till?->code ?? 'GUI-GENERIC',
-                'cashier_name' => $tx->cashier?->name ?? 'Agent de guichet',
+                'cashier_name' => $tx->initiator?->name ?? 'Agent de guichet',
                 'payment_method' => $tx->payment_method ?? 'Espèces',
                 'created_at_formatted' => $tx->created_at->format('d/m/Y à H:i'),
             ];

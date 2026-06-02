@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\AgencyReportController;use App\Http\Controllers\Api
 use App\Http\Controllers\Api\CashierSessionController;
 use App\Http\Controllers\Api\CashOperationController;
 use App\Http\Controllers\Api\CityController;
+use App\Http\Controllers\Api\CommissionController;
 use App\Http\Controllers\Api\CountryController;
 use App\Http\Controllers\Api\CustomerController;
 use App\Http\Controllers\Api\FeesTableController;
@@ -27,6 +28,7 @@ Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login'])->name('login')->middleware('throttle:login_throttle');
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password', [AuthController::class, 'resetPassword']);
+    Route::post('refresh', [AuthController::class, 'refresh']);
 });
 
 // ==========================================
@@ -49,11 +51,12 @@ Route::middleware(['auth:sanctum'])->group(function () {
      | Espace Guichet / Caisse (Cashier, Merchant & Administrateurs)
      |--------------------------------------------------------------------------
      */
-    Route::middleware(['role:cashier|merchant|super_admin'])->group(function () {
+    Route::middleware(['role:cashier|merchant|super_admin|country_admin'])->group(function () {
 
         // Données géographiques de service
         Route::get('/countries', [CountryController::class, 'index']);
         Route::get('/cities/agency', [CityController::class, 'getCityByAgencyCountry']);
+        Route::get('/cities/by/country', [CityController::class, 'getCityByCountry']);
 
         // Gestion des clients & Conformité KYC de premier niveau
         Route::get('/customers', [CustomerController::class, 'index']);
@@ -105,6 +108,12 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/agency/vaults', [AgencyVaultController::class, 'index']);
         Route::post('/agency/vaults/transaction', [AgencyVaultController::class, 'storeTransaction']);
         Route::get('/agency/reports', [AgencyReportController::class, 'index']);
+
+        Route::get('/fraud-checks', [ReportingController::class, 'fraudCheckHistory']);
+        Route::get('/logs/system', [ReportingController::class, 'systemeLogs']);
+        Route::get('/logs/connections', [ReportingController::class, 'historyLogs']);
+        Route::get('/commissions', [CommissionController::class, 'index']);
+        Route::get('/accounting/preview', [ReportingController::class, 'previewDocument']);
     });
 
     /*
@@ -116,7 +125,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
         // Gestion de la liquidité des coffres agences (Vault Management)
         Route::post('/agencies/{id}/adjust-vault', [AgencyController::class, 'adjustVault']);
-
+        Route::post('/agencies', [AgencyController::class, 'store']);
         // Configuration des corridors et grilles tarifaires
         Route::get('/regional/fees', [FeesTableController::class, 'getRegionalFees']);
         Route::post('/regional/fees', [FeesTableController::class, 'storeFee']);
@@ -148,14 +157,14 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::patch('/cities/{uuid}/toggle', [CityController::class, 'toggleStatus']);
 
        // Gestion du personnel (Staff) de l'ensemble du réseau
-        Route::get('/staff', [StaffController::class, 'index']);
-        Route::get('/staff/dependencies', [StaffController::class, 'dependencies']);
-        Route::post('/staff', [StaffController::class, 'store']);
+       // Route::get('/staff', [StaffController::class, 'index']);
+        //Route::get('/staff/dependencies', [StaffController::class, 'dependencies']);
+       // Route::post('/staff', [StaffController::class, 'store']);
         Route::patch('/staff/{uuid}/toggle', [StaffController::class, 'toggleStatus']);
 
         // Création et activation des implantations d'agences
         Route::get('/agencies/dependencies', [AgencyController::class, 'dependencies']);
-        Route::post('/agencies', [AgencyController::class, 'store']);
+       // Route::post('/agencies', [AgencyController::class, 'store']);
         Route::patch('/agencies/{uuid}/toggle', [AgencyController::class, 'toggleStatus']);
 
         Route::get('/fees', [FeesTableController::class, 'index']);

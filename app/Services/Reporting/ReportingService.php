@@ -131,7 +131,7 @@ class ReportingService
             ->whereNull('transactions.deleted_at') // Sécurité SoftDeletes en SQL brut
             ->groupBy('source_country.id', 'source_country.name', 'destination_country.id', 'destination_country.name')
             ->orderByDesc('tx_count')
-            ->limit(5)
+            ->limit(10)
             ->get();
 
         $totalTransactions = $corridors->sum('tx_count');
@@ -153,11 +153,22 @@ class ReportingService
     |--------------------------------------------------------------------------
     */
 
-    private function getLowLiquidityAgenciesCount(): int
+  /*  private function getLowLiquidityAgenciesCount(): int
     {
         return Agency::query()
             ->where('is_active', true)
             ->where('current_balance', '<', self::DEFAULT_LIQUIDITY_THRESHOLD)
+            ->count();
+    }*/
+    private function getLowLiquidityAgenciesCount(): int
+    {
+        return Agency::query()
+            ->where('is_active', true)
+            ->whereHas('wallets', function ($query) {
+                $query->where('type', 'main')
+                    ->where('is_active', true)
+                    ->where('balance', '<', self::DEFAULT_LIQUIDITY_THRESHOLD);
+            })
             ->count();
     }
 
@@ -172,7 +183,6 @@ class ReportingService
 
     private function countActiveCorridors(): int
     {
-        // Alignement sur les vraies colonnes : sender_country_id et recipient_country_id
         return Transaction::query()
                 ->where('status', 'completed')
                 ->selectRaw('COUNT(DISTINCT CONCAT(sender_country_id, "-", recipient_country_id)) as total')

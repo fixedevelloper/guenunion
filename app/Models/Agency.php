@@ -105,7 +105,10 @@ class Agency extends Model
     {
         return $this->hasMany(Staff::class, 'agency_id');
     }
-
+    public function tills(): HasMany
+    {
+        return $this->hasMany(Till::class, 'agency_id');
+    }
     /**
      * LE COFFRE-FORT DE L'AGENCE (Portefeuille principal, compte de clearing ou de commissions)
      * Accès : $agency->wallets()->where('type', 'main')->first();

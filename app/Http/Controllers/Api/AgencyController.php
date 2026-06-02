@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Agency;
+use App\Models\Transaction;
 use App\Models\Wallet;
 use App\Models\TransactionEntry;
 use App\Models\SystemAuditLog;
@@ -257,6 +258,7 @@ class AgencyController extends Controller
 
     /**
      * AJUSTEMENT ET APPROVISIONNEMENT DE COFFRE (FORCAGE OU DECAISSEMENT).
+     * Enregistre une transaction parente de type 'adjustment' et ses écritures comptables.
      */
     public function adjustVault(Request $request, string $uuid): JsonResponse
     {
@@ -272,6 +274,7 @@ class AgencyController extends Controller
             'action'      => 'required|string|in:fund,debit',
             'amount'      => 'required|numeric|min:5000',
             'description' => 'required|string|max:255|min:5',
+            'is_physical' => 'nullable|boolean'
         ]);
 
         try {
@@ -279,10 +282,11 @@ class AgencyController extends Controller
             $agency = Agency::where('uuid', $uuid)->firstOrFail();
             $amount = (float) $request->input('amount');
             $action = $request->input('action');
+            $isPhysical = (bool) $request->input('is_physical', false);
 
-            DB::transaction(function () use ($operator, $agency, $amount, $action, $request) {
+            $transaction = DB::transaction(function () use ($operator, $agency, $amount, $action, $isPhysical, $request) {
 
-                // Verrouillage pessimiste de la ligne pour éviter les race conditions de solde (FinTech-safe)
+                // 1. Verrouillage du portefeuille virtuel principal de l'agence (Cible)
                 $agencyWallet = Wallet::where('owner_type', Agency::class)
                     ->where('owner_id', $agency->id)
                     ->where('type', 'main')
@@ -290,75 +294,148 @@ class AgencyController extends Controller
                     ->first();
 
                 if (!$agencyWallet || !$agencyWallet->is_active) {
-                    throw new Exception("Coffre d'agence introuvable, suspendu ou non initialisé.");
+                    throw new Exception("Coffre virtuel d'agence introuvable, suspendu ou non initialisé.");
                 }
 
-                $balanceBefore = (float) $agencyWallet->balance;
+                // 2. Verrouillage du portefeuille de contrepartie du Système (Type: escrow ou system_master selon votre nomenclature)
+                $systemMasterWallet = Wallet::where('type', 'escrow')
+                    ->where('currency', $agencyWallet->currency)
+                    ->where('is_active', true)
+                    ->lockForUpdate()
+                    ->first();
 
-                if ($action === 'fund') {
-                    $agencyWallet->balance = $balanceBefore + $amount;
-                    $entryType = 'credit';
-                } else {
-                    if ($balanceBefore < $amount) {
-                        throw new Exception("Solde de coffre insuffisant pour effectuer ce décaissement.");
-                    }
-                    $agencyWallet->balance = $balanceBefore - $amount;
-                    $entryType = 'debit';
+                if (!$systemMasterWallet) {
+                    throw new Exception("Compte de trésorerie centrale indisponible pour cette devise.");
                 }
 
-                $agencyWallet->save();
+                // 3. CRÉATION DE LA TRANSACTION PARENTE (Audit principal)
+                $reference = 'ADJ-' . now()->format('Ymd') . '-' . strtoupper(Str::random(6));
 
-                // Signature cryptographique de la ligne du registre Ledger pour l'immuabilité financière
-                $signature = $this->ledgerService->generateSignature(
-                    $agencyWallet->id,
-                    $amount,
-                    $entryType,
-                    $balanceBefore,
-                    (float) $agencyWallet->balance
-                );
-
-                // Écriture dans le grand livre comptable (Ledger Entry)
-                TransactionEntry::create([
-                    'transaction_id' => null, // NULL car il s'agit d'un réajustement de fonds propre et non d'un virement client
-                    'wallet_id'      => $agencyWallet->id,
-                    'entry_type'     => $entryType,
-                    'amount'         => $amount,
-                    'balance_before' => $balanceBefore,
-                    'balance_after'  => $agencyWallet->balance,
-                    'row_signature'  => $signature
+                $transaction = Transaction::create([
+                    'uuid'                  => (string) Str::uuid(),
+                    'reference'             => $reference,
+                    'type'                  => 'adjustment',
+                    'status'                => 'initiated',
+                    'amount'                => $amount,
+                    'fees'                  => 0,
+                    'taxes'                 => 0,
+                    'currency'              => $agencyWallet->currency,
+                    'source_agency_id'      => $action === 'debit' ? $agency->id : null,
+                    'destination_agency_id' => $action === 'fund' ? $agency->id : null,
+                    'initiator_id'          => $operator->id,
+                    'description'           => $request->input('description'),
+                    'metadata'              => [
+                        'is_physical' => $isPhysical,
+                        'action_type' => $action,
+                        'triggered_by' => $operator->name
+                    ]
                 ]);
 
-                // Synchronisation de la colonne de cache dénormalisée sur la table agences
+                $agencyBalanceBefore = (float) $agencyWallet->balance;
+                $systemBalanceBefore = (float) $systemMasterWallet->balance;
+
                 if ($action === 'fund') {
-                    $agency->increment('current_balance', $amount);
+                    if ($systemBalanceBefore < $amount) {
+                        throw new Exception("Trésorerie centrale insuffisante pour allouer cette ligne de provision.");
+                    }
+
+                    $agencyWallet->increment('balance', $amount);
+                    $systemMasterWallet->decrement('balance', $amount);
+
+                    $agencyEntryType = 'credit';
+                    $systemEntryType = 'debit';
                 } else {
-                    $agency->decrement('current_balance', $amount);
+                    if ($agencyBalanceBefore < $amount) {
+                        throw new Exception("Solde de coffre virtuel insuffisant pour effectuer ce retrait.");
+                    }
+
+                    $agencyWallet->decrement('balance', $amount);
+                    $systemMasterWallet->increment('balance', $amount);
+
+                    $agencyEntryType = 'debit';
+                    $systemEntryType = 'credit';
                 }
 
-                // Journalisation d'audit de sécurité
+                // 4. DOUBLE ÉCRITURE DANS LE GRAND LIVRE (Liaison obligatoire via transaction_id)
+
+                // Écriture Agence (Cible)
+                $agencySignature = $this->ledgerService->generateSignature(
+                    $agencyWallet->id, $amount, $agencyEntryType, $agencyBalanceBefore, (float) $agencyWallet->fresh()->balance
+                );
+                TransactionEntry::create([
+                    'uuid'           => (string) Str::uuid(),
+                    'transaction_id' => $transaction->id, // ✅ Lié à la transaction d'ajustement
+                    'wallet_id'      => $agencyWallet->id,
+                    'entry_type'     => $agencyEntryType,
+                    'amount'         => $amount,
+                    'balance_before' => $agencyBalanceBefore,
+                    'balance_after'  => $agencyWallet->fresh()->balance,
+                    'row_signature'  => $agencySignature
+                ]);
+
+                // Écriture Système (Contrepartie comptable)
+                $systemSignature = $this->ledgerService->generateSignature(
+                    $systemMasterWallet->id, $amount, $systemEntryType, $systemBalanceBefore, (float) $systemMasterWallet->fresh()->balance
+                );
+                TransactionEntry::create([
+                    'uuid'           => (string) Str::uuid(),
+                    'transaction_id' => $transaction->id, // ✅ Lié à la transaction d'ajustement
+                    'wallet_id'      => $systemMasterWallet->id,
+                    'entry_type'     => $systemEntryType,
+                    'amount'         => $amount,
+                    'balance_before' => $systemBalanceBefore,
+                    'balance_after'  => $systemMasterWallet->fresh()->balance,
+                    'row_signature'  => $systemSignature
+                ]);
+
+                // 5. MISE À JOUR DE L'ENCAISSE PHYSIQUE (Optionnelle)
+                if ($isPhysical) {
+                    if ($action === 'fund') {
+                        $agency->increment('current_balance', $amount);
+                    } else {
+                        if ((float) $agency->current_balance < $amount) {
+                            throw new Exception("L'encaisse physique en espèces de l'agence est inférieure au montant du décaissement demandé.");
+                        }
+                        $agency->decrement('current_balance', $amount);
+                    }
+                }
+
+                // 6. CLÔTURE DE LA TRANSACTION PARENTE
+                $transaction->update([
+                    'status'       => 'completed',
+                    'completed_at' => now()
+                ]);
+
+                // 7. JOURNALISATION D'AUDIT SÉCURITÉ
                 SystemAuditLog::create([
                     'uuid'       => (string) Str::uuid(),
                     'user_id'    => $operator->id,
                     'agency_id'  => $agency->id,
                     'event_type' => 'VAULT.ADJUSTMENT',
                     'severity'   => $action === 'fund' ? 'info' : 'warning',
-                    'message'    => "Ajustement manuel du coffre de l'agence par l'opérateur. Action : {$action}.",
+                    'message'    => "Ajustement de coffre effectué via transaction #{$reference}.",
                     'payload'    => [
-                        'agency_code'    => $agency->code,
-                        'action_type'    => $action,
-                        'amount'         => $amount,
-                        'balance_before' => $balanceBefore,
-                        'balance_after'  => $agencyWallet->balance,
-                        'description'    => $request->input('description')
+                        'transaction_uuid' => $transaction->uuid,
+                        'reference'        => $reference,
+                        'action_type'      => $action,
+                        'is_physical'      => $isPhysical,
+                        'amount'           => $amount,
+                        'description'      => $request->input('description')
                     ],
                     'ip_address' => request()->ip(),
                     'user_agent' => request()->userAgent(),
                 ]);
+
+                return $transaction;
             });
 
             return response()->json([
                 'success' => true,
-                'message' => "Ajustement de coffre effectué et signé cryptographiquement avec succès."
+                'message' => "Ajustement de coffre traité, signé et enregistré sous la référence {$transaction->reference}.",
+                'data'    => [
+                    'reference' => $transaction->reference,
+                    'status'    => $transaction->status
+                ]
             ], 200);
 
         } catch (Exception $e) {
