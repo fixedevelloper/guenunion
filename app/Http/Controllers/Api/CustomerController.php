@@ -470,4 +470,87 @@ class CustomerController extends Controller
             'message' => 'Le dossier de conformité KYC a été traité avec succès.'
         ], 200);
     }
+    /**
+     * Récupérer le profil du client connecté.
+     */
+    public function showMe(Request $request): JsonResponse
+    {
+        try {
+            $customer = Auth::user()->customer;
+
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Profil client introuvable.'
+                ], 404);
+            }
+
+            // Charger les détails de l'utilisateur lié
+            $customer->load('user');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profil client récupéré avec succès.',
+                'data' => $customer
+            ], 200);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération du profil.',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Mettre à jour le profil du client connecté.
+     */
+    public function update(Request $request): JsonResponse
+    {
+        $user = Auth::user();
+        $customer = $user->customer;
+
+        if (!$customer) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Profil client introuvable.'
+            ], 404);
+        }
+
+        // Validation des données reçues de l'application Flutter
+        $request->validate([
+            'first_name' => 'sometimes|string|max:255',
+            'last_name'  => 'sometimes|string|max:255',
+            'email'      => 'sometimes|nullable|email|unique:users,email,' . $user->id,
+        ]);
+
+        try {
+            // 1. Mettre à jour la table 'users' (champs partagés)
+            $userFields = $request->only(['first_name', 'last_name', 'email']);
+            if (!empty($userFields)) {
+                $user->update($userFields);
+            }
+
+            // 2. Mettre à jour la table 'customers' si tu as des champs spécifiques
+            // (ex: adresse, metadata, etc.) transmis depuis Flutter
+            // $customer->update($request->only(['champs_customer']));
+
+            // 3. Recharger la relation fraîchement mise à jour
+            $customer->load('user');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profil mis à jour avec succès.',
+                'data' => $customer
+            ], 200);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la mise à jour du profil.',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
 }

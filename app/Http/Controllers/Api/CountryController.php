@@ -18,6 +18,13 @@ class CountryController extends Controller
             'data' => Country::with('cities')->orderBy('name', 'asc')->get()
         ], 200);
     }
+    public function countries()
+    {
+        return response()->json([
+            'success' => true,
+            'data' => Country::query()->orderBy('name', 'asc')->get()
+        ], 200);
+    }
 
     public function store(Request $request)
     {

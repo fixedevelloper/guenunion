@@ -7,6 +7,8 @@ use App\Http\Controllers\Api\CashOperationController;
 use App\Http\Controllers\Api\CityController;
 use App\Http\Controllers\Api\CommissionController;
 use App\Http\Controllers\Api\CountryController;
+use App\Http\Controllers\Api\customer\TransactionController;
+use App\Http\Controllers\Api\customer\WalletController;
 use App\Http\Controllers\Api\CustomerController;
 use App\Http\Controllers\Api\FeesTableController;
 use App\Http\Controllers\Api\RemittanceController;
@@ -29,6 +31,11 @@ Route::prefix('auth')->group(function () {
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password', [AuthController::class, 'resetPassword']);
     Route::post('refresh', [AuthController::class, 'refresh']);
+    Route::prefix('otp')->group(function () {
+        // La route POST demandée
+        Route::post('send', [AuthController::class, 'sendOtpRequest']);
+        Route::post('verify', [AuthController::class, 'verifyOtp']);
+    });
 });
 
 // ==========================================
@@ -38,7 +45,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
     // Déconnexion générique
     Route::post('/logout', [AuthController::class, 'logout']);
-
+    Route::get('/auth/me', [AuthController::class, 'me']);
     /*
      |--------------------------------------------------------------------------
      | Espace Simulation (Accessible par tout le personnel authentifié)
@@ -46,6 +53,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
      */
     Route::post('/remittance/estimate-fees', [RemittanceController::class, 'estimateFees']);
 
+    Route::middleware(['role:customer'])->group(function () {
+        Route::get('/me/countries', [CountryController::class, 'countries']);
+        Route::get('/me/transactions', [TransactionController::class, 'index']);
+        Route::get('/wallets', [WalletController::class, 'index']);
+        Route::get('/customers/me', [CustomerController::class, 'showMe']);
+        Route::put('/customers/me', [CustomerController::class, 'update']); // PUT ou PATCH selon ta préférence
+    });
     /*
      |--------------------------------------------------------------------------
      | Espace Guichet / Caisse (Cashier, Merchant & Administrateurs)

@@ -69,6 +69,8 @@ class TransferController extends Controller
 
     /**
      * Exécute le transfert de compte à compte avec contrôles Ledger, Fraude et Ventilation.
+     * @param Request $request
+     * @return JsonResponse
      */
     public function execute(Request $request): JsonResponse
     {

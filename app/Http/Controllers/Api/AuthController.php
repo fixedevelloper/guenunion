@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
 class AuthController extends Controller
@@ -114,7 +115,20 @@ class AuthController extends Controller
             Log::error("Impossible d'écrire l'historique d'accès (LoginHistory) : " . $e->getMessage());
         }
     }
+    /**
+     * Obtenir l'utilisateur authentifié.
+     */
+    public function me(Request $request): JsonResponse
+    {
+        // On retourne l'user avec son profil client chargé s'il existe
+        $user = $request->user()->load('customer');
 
+        return response()->json([
+            'success' => true,
+            'message' => 'Profil utilisateur récupéré.',
+            'data' => $user
+        ], 200);
+    }
     /**
      * ÉTAPE 1 : DEMANDE DE RÉINITIALISATION (Forgot Password).
      */
@@ -312,6 +326,140 @@ class AuthController extends Controller
     } catch (Exception $e) {
             Log::error("Erreur critique lors du rafraîchissement du jeton : " . $e->getMessage());
             return response()->json(['success' => false, 'message' => 'Une erreur interne est survenue.'], 500);
+        }
+    }
+    public function sendOtpRequest(Request $request): JsonResponse
+    {
+        // 1. Validation du format du payload
+        $validator = Validator::make($request->all(), [
+            'phone_number' => [
+                'required',
+                'string',
+                'regex:/^\+237[6][5-9][0-9]{7}$/'
+            ],
+        ], [
+            'phone_number.required' => 'Le numéro de téléphone est obligatoire.',
+            'phone_number.regex' => 'Le format du numéro de téléphone est invalide pour le Cameroun (+237...).',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            $phoneNumber = $request->input('phone_number');
+
+            // 2. VÉRIFICATION D'EXISTENCE EN BD
+            $user = User::where('phone_number', $phoneNumber)->first();
+
+            if (!$user) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun compte n\'est associé à ce numéro de téléphone.'
+                ], 404); // 404 ou 422 selon votre préférence d'API
+            }
+
+            // 3. Vérification du statut (Optionnel mais recommandé)
+            if (!$user->is_active) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Ce compte est suspendu ou inactif.'
+                ], 403);
+            }
+
+            // 4. Génération du code OTP aléatoire
+            $otpCode = rand(100000, 999999);
+
+            // TODO: Sauvegarder l'OTP en base de données ou en Cache pour la future vérification
+            // ex: Cache::put('otp_'.$phoneNumber, $otpCode, now()->addMinutes(5));
+            // TODO: Envoyer le SMS via votre passerelle (MTN/Orange/etc.)
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Le code OTP a été généré avec succès.',
+                'debug_code' => $otpCode // À retirer en production
+            ], 200);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Une erreur est survenue lors de l\'envoi de l\'OTP.',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function verifyOtp(Request $request): JsonResponse
+    {
+        // 1. Validation des données reçues de Flutter
+        $request->validate([
+            'phone_number' => 'required|string',
+            'code'         => 'required|string', // Aligné avec ton implémentation Flutter actuelle ('code')
+        ]);
+
+        try {
+            $phoneNumber = $request->input('phone_number');
+            $otpCode = $request->input('code');
+
+            // 2. Récupérer l'utilisateur avec son profil client associé
+            $user = User::where('phone_number', $phoneNumber)->first();
+
+            if (!$user) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Utilisateur introuvable.'
+                ], 404);
+            }
+
+            // 3. Logique de vérification de l'OTP
+            $isOtpValid = true; // ⚠️ À remplacer par ta vraie logique de vérification (Cache ou DB)
+
+            if (!$isOtpValid) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Le code OTP saisi est incorrect ou expiré.'
+                ], 400);
+            }
+
+            // 4. Sécurité : On nettoie les anciens jetons
+            $user->tokens()->delete();
+
+            // 5. Génération du Token d'accès Sanctum final
+            $token = $user->createToken('auth_token')->plainTextToken;
+
+            // 6. Récupérer le profil customer et charger dynamiquement la relation 'user'
+            $customer = $user->customer;
+
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Ce compte utilisateur n\'a pas de profil client associé.'
+                ], 404);
+            }
+
+            // 💡 Lazy Eager Loading : Injecte les infos de l'User au premier niveau du Customer
+            $customer->load('user');
+
+            // 7. Retourner la réponse formattée sous la clé 'data'
+            return response()->json([
+                'success' => true,
+                'message' => 'Authentification réussie.',
+                'data' => [
+                    'access_token' => $token,
+                    'token_type'   => 'Bearer',
+                    'customer'     => $customer // Contient l'objet customer imbriqué avec 'user'
+                ]
+            ], 200);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la vérification de l\'OTP.',
+                'error'        => $e->getMessage()
+            ], 500);
         }
     }
 }
