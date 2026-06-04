@@ -18,6 +18,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Symfony\Component\Uid\Factory\string;
 
 class AgencyController extends Controller
 {
@@ -259,11 +260,28 @@ class AgencyController extends Controller
     /**
      * AJUSTEMENT ET APPROVISIONNEMENT DE COFFRE (FORCAGE OU DECAISSEMENT).
      * Enregistre une transaction parente de type 'adjustment' et ses écritures comptables.
+     * @param Request $request
+     * @param string $uuid
+     * @return JsonResponse
      */
+
     public function adjustVault(Request $request, string $uuid): JsonResponse
     {
+        Log::warning("Initialisation à l'ajustement de coffre", [
+            'user_id' => Auth::id(),
+            'user_email' => Auth::user()->email ?? 'Inconnu',
+            'agency_uuid' => $uuid,
+            'ip' => request()->ip()
+        ]);
         // Alignement des rôles Spatie
         if (!Auth::user()->hasAnyRole(['super_admin', 'country_admin'])) {
+            Log::warning("Tentative d'accès non autorisée à l'ajustement de coffre", [
+                'user_id' => Auth::id(),
+                'user_email' => Auth::user()->email ?? 'Inconnu',
+                'agency_uuid' => $uuid,
+                'ip' => request()->ip()
+            ]);
+
             return response()->json([
                 'success' => false,
                 'message' => 'Action refusée. Niveau d\'accréditation insuffisant.'
@@ -277,8 +295,18 @@ class AgencyController extends Controller
             'is_physical' => 'nullable|boolean'
         ]);
 
+        $operator = Auth::user();
+
+        // Log de début de procédure informatique
+        Log::info("Début de la procédure d'ajustement de coffre", [
+            'operator_id' => $operator->id,
+            'agency_uuid' => $uuid,
+            'action'      => $request->input('action'),
+            'amount'      => $request->input('amount'),
+            'is_physical' => $request->input('is_physical', false)
+        ]);
+
         try {
-            $operator = Auth::user();
             $agency = Agency::where('uuid', $uuid)->firstOrFail();
             $amount = (float) $request->input('amount');
             $action = $request->input('action');
@@ -294,10 +322,11 @@ class AgencyController extends Controller
                     ->first();
 
                 if (!$agencyWallet || !$agencyWallet->is_active) {
+                    Log::error("Échec ajustement : Portefeuille agence introuvable ou inactif", ['agency_id' => $agency->id]);
                     throw new Exception("Coffre virtuel d'agence introuvable, suspendu ou non initialisé.");
                 }
 
-                // 2. Verrouillage du portefeuille de contrepartie du Système (Type: escrow ou system_master selon votre nomenclature)
+                // 2. Verrouillage du portefeuille de contrepartie du Système
                 $systemMasterWallet = Wallet::where('type', 'escrow')
                     ->where('currency', $agencyWallet->currency)
                     ->where('is_active', true)
@@ -305,6 +334,7 @@ class AgencyController extends Controller
                     ->first();
 
                 if (!$systemMasterWallet) {
+                    Log::error("Échec ajustement : Trésorerie centrale introuvable", ['currency' => $agencyWallet->currency]);
                     throw new Exception("Compte de trésorerie centrale indisponible pour cette devise.");
                 }
 
@@ -336,6 +366,11 @@ class AgencyController extends Controller
 
                 if ($action === 'fund') {
                     if ($systemBalanceBefore < $amount) {
+                        Log::warning("Échec ajustement : Solde système insuffisant pour fund", [
+                            'reference' => $reference,
+                            'system_balance' => $systemBalanceBefore,
+                            'requested_amount' => $amount
+                        ]);
                         throw new Exception("Trésorerie centrale insuffisante pour allouer cette ligne de provision.");
                     }
 
@@ -346,6 +381,11 @@ class AgencyController extends Controller
                     $systemEntryType = 'debit';
                 } else {
                     if ($agencyBalanceBefore < $amount) {
+                        Log::warning("Échec ajustement : Solde agence insuffisant pour debit", [
+                            'reference' => $reference,
+                            'agency_balance' => $agencyBalanceBefore,
+                            'requested_amount' => $amount
+                        ]);
                         throw new Exception("Solde de coffre virtuel insuffisant pour effectuer ce retrait.");
                     }
 
@@ -356,7 +396,7 @@ class AgencyController extends Controller
                     $systemEntryType = 'credit';
                 }
 
-                // 4. DOUBLE ÉCRITURE DANS LE GRAND LIVRE (Liaison obligatoire via transaction_id)
+                // 4. DOUBLE ÉCRITURE DANS LE GRAND LIVRE
 
                 // Écriture Agence (Cible)
                 $agencySignature = $this->ledgerService->generateSignature(
@@ -364,7 +404,7 @@ class AgencyController extends Controller
                 );
                 TransactionEntry::create([
                     'uuid'           => (string) Str::uuid(),
-                    'transaction_id' => $transaction->id, // ✅ Lié à la transaction d'ajustement
+                    'transaction_id' => $transaction->id,
                     'wallet_id'      => $agencyWallet->id,
                     'entry_type'     => $agencyEntryType,
                     'amount'         => $amount,
@@ -379,7 +419,7 @@ class AgencyController extends Controller
                 );
                 TransactionEntry::create([
                     'uuid'           => (string) Str::uuid(),
-                    'transaction_id' => $transaction->id, // ✅ Lié à la transaction d'ajustement
+                    'transaction_id' => $transaction->id,
                     'wallet_id'      => $systemMasterWallet->id,
                     'entry_type'     => $systemEntryType,
                     'amount'         => $amount,
@@ -394,10 +434,21 @@ class AgencyController extends Controller
                         $agency->increment('current_balance', $amount);
                     } else {
                         if ((float) $agency->current_balance < $amount) {
+                            Log::warning("Échec ajustement : Encaisse physique insuffisante pour l'agence", [
+                                'reference' => $reference,
+                                'physical_balance' => $agency->current_balance,
+                                'requested_amount' => $amount
+                            ]);
                             throw new Exception("L'encaisse physique en espèces de l'agence est inférieure au montant du décaissement demandé.");
                         }
                         $agency->decrement('current_balance', $amount);
                     }
+
+                    Log::info("Encaisse physique mise à jour pour l'agence", [
+                        'reference' => $reference,
+                        'agency_id' => $agency->id,
+                        'new_physical_balance' => $agency->fresh()->current_balance
+                    ]);
                 }
 
                 // 6. CLÔTURE DE LA TRANSACTION PARENTE
@@ -406,7 +457,7 @@ class AgencyController extends Controller
                     'completed_at' => now()
                 ]);
 
-                // 7. JOURNALISATION D'AUDIT SÉCURITÉ
+                // 7. JOURNALISATION D'AUDIT SÉCURITÉ (Base de données)
                 SystemAuditLog::create([
                     'uuid'       => (string) Str::uuid(),
                     'user_id'    => $operator->id,
@@ -429,6 +480,15 @@ class AgencyController extends Controller
                 return $transaction;
             });
 
+            // Log d'application de succès final (Fichiers logs de Laravel)
+            Log::info("Ajustement de coffre validé avec succès", [
+                'reference'   => $transaction->reference,
+                'operator_id' => $operator->id,
+                'agency_id'   => $agency->id,
+                'action'      => $action,
+                'amount'      => $amount
+            ]);
+
             return response()->json([
                 'success' => true,
                 'message' => "Ajustement de coffre traité, signé et enregistré sous la référence {$transaction->reference}.",
@@ -439,7 +499,15 @@ class AgencyController extends Controller
             ], 200);
 
         } catch (Exception $e) {
-            Log::error("Échec ajustement coffre : " . $e->getMessage());
+            // Log d'erreur critique avec contexte complet et trace
+            Log::error("Échec critique de l'ajustement de coffre", [
+                'message'     => $e->getMessage(),
+                'operator_id' => $operator->id ?? null,
+                'agency_uuid' => $uuid,
+                'payload'     => $request->only(['action', 'amount', 'is_physical']),
+                'trace'       => $e->getTraceAsString()
+            ]);
+
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage()
