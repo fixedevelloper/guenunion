@@ -30,7 +30,7 @@ class WalletEscrowSeeder extends Seeder
                     'owner_type'    => null, // Le compte escrow appartient au système
                     'owner_id'      => null,
                     'wallet_number' => 'ESCROW-' . $currency . '-SYS',
-                    'balance'       => 0.00, // Commence à 0, il augmente aux émissions et diminue aux paiements
+                    'balance'       => 1000000.00, // Commence à 0, il augmente aux émissions et diminue aux paiements
                     'is_active'     => true,
                     'ledger_hash'   => hash('sha256', "ESCROW-INIT-{$currency}-0.00"),
                 ]
