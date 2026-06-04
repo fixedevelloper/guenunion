@@ -129,7 +129,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/commissions', [CommissionController::class, 'index']);
         Route::get('/accounting/preview', [ReportingController::class, 'previewDocument']);
     });
-
+    Route::post('/agencies/{id}/adjust-vault', [AgencyController::class, 'adjustVault']);
     /*
      |--------------------------------------------------------------------------
      | Espace Haute Administration & Conformité Pays (Country Admin, Super Admin)
@@ -138,7 +138,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::middleware(['role:country_admin|super_admin'])->group(function () {
 
         // Gestion de la liquidité des coffres agences (Vault Management)
-        Route::post('/agencies/{id}/adjust-vault', [AgencyController::class, 'adjustVault']);
+
         Route::post('/agencies', [AgencyController::class, 'store']);
         // Configuration des corridors et grilles tarifaires
         Route::get('/regional/fees', [FeesTableController::class, 'getRegionalFees']);
