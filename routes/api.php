@@ -56,9 +56,11 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::middleware(['role:customer'])->group(function () {
         Route::get('/me/countries', [CountryController::class, 'countries']);
         Route::get('/me/transactions', [TransactionController::class, 'index']);
-        Route::get('/wallets', [WalletController::class, 'index']);
+        Route::get('/me/wallets', [WalletController::class, 'index']);
         Route::get('/customers/me', [CustomerController::class, 'showMe']);
         Route::put('/customers/me', [CustomerController::class, 'update']); // PUT ou PATCH selon ta préférence
+        Route::get('/me/remittance/estimate-fees', [TransactionController::class, 'estimateFees']);
+        Route::post('/me/transactions', [TransactionController::class, 'makeTransaction']);
     });
     /*
      |--------------------------------------------------------------------------

@@ -146,6 +146,8 @@ class RemittanceController extends Controller
 
     /**
      * ÉTAPE 1 : Estimer les frais en temps réel selon le corridor de pays.
+     * @param Request $request
+     * @return JsonResponse
      */
     public function estimateFees(Request $request): JsonResponse
     {

@@ -29,7 +29,7 @@ class FraudCheckService
                 ->where('created_at', '>=', now()->startOfDay())
                 ->count();
 
-            if ($todayCount >= 5) {
+            if ($todayCount >= 10) {
                 $score += 50;
                 $reasons[] = "Vélocité suspecte : {$todayCount} opérations globales aujourd'hui.";
             }
@@ -130,6 +130,9 @@ class FraudCheckService
 
     /**
      * Enregistre le contrôle de fraude de manière immuable dans le Ledger.
+     * @param int $transactionId
+     * @param array $analysis
+     * @return FraudCheck
      */
     public function logCheck(int $transactionId, array $analysis): FraudCheck
     {

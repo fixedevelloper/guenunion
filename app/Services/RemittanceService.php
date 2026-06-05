@@ -80,6 +80,11 @@ class RemittanceService
 
     /**
      * Initie un transfert d'argent (Remittance) au guichet émetteur.
+     * @param User $initiator
+     * @param Agency $sourceAgency
+     * @param array $data
+     * @return Transaction
+     * @throws Exception
      */
     public function initiateRemittance(User $initiator, Agency $sourceAgency, array $data): Transaction
     {
@@ -330,7 +335,7 @@ class RemittanceService
     /**
      * Générer un code secret de retrait unique immuable à 12 chiffres.
      */
-    private function generateSecureCode(): string
+    public function generateSecureCode(): string
     {
         do {
             $code = '';
@@ -346,14 +351,14 @@ class RemittanceService
     /**
      * Générer une signature de sécurité HMAC pour l'intégrité du Grand Livre comptable.
      */
-    private function generateLedgerSignature(int $walletId, float $amount, string $type, float $balanceBefore, float $balanceAfter): string
+    public function generateLedgerSignature(int $walletId, float $amount, string $type, float $balanceBefore, float $balanceAfter): string
     {
         return app(LedgerService::class)->generateSignature($walletId, $amount, $type, $balanceBefore, $balanceAfter);
     }
 }
 
-if (!function_exists('clean_phone')) {
+/*if (!function_exists('clean_phone')) {
     function clean_phone(?string $phone): string {
         return $phone ? preg_replace('/[^0-9]/', '', $phone) : '';
     }
-}
+}*/
