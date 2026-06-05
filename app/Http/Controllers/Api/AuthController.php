@@ -335,11 +335,11 @@ class AuthController extends Controller
             'phone_number' => [
                 'required',
                 'string',
-                'regex:/^\+237[6][5-9][0-9]{7}$/'
+               // 'regex:/^\+237[6][5-9][0-9]{7}$/'
             ],
         ], [
             'phone_number.required' => 'Le numéro de téléphone est obligatoire.',
-            'phone_number.regex' => 'Le format du numéro de téléphone est invalide pour le Cameroun (+237...).',
+            //'phone_number.regex' => 'Le format du numéro de téléphone est invalide pour le Cameroun (+237...).',
         ]);
 
         if ($validator->fails()) {
