@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
 
 class Customer extends Model
@@ -54,5 +55,11 @@ class Customer extends Model
     public function mainWallet()
     {
         return $this->morphOne(Wallet::class, 'owner')->where('type', 'main');
+    }
+    public function scopeHandleSort(Builder $query): Builder
+    {
+        // Si tu as une logique de tri dynamique via la requête, applique-la ici.
+        // Sinon, applique un tri par défaut (par exemple, du plus récent au plus ancien).
+        return $query->orderBy('id', 'desc');
     }
 }

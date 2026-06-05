@@ -7,6 +7,7 @@ use App\Models\Customer;
 use App\Models\Transaction;
 use App\Models\User;
 use App\Models\Staff;
+use App\Models\Wallet;
 use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -59,7 +60,7 @@ class CustomerController extends Controller
 
             // Limitation pour optimiser la performance de l'autocomplétion sur l'UI Next.js
             $customers = $query->whereHas('user')
-                ->handleSort($query) // Utilisation de votre scope ou tri standard
+              //  ->handleSort($query) // Utilisation de votre scope ou tri standard
                 ->limit(10)
                 ->get();
 
@@ -94,34 +95,122 @@ class CustomerController extends Controller
             ], 500);
         }
     }
+    public function customers(Request $request): JsonResponse
+    {
+        try {
+            $user = Auth::user();
+            $staff = Staff::where('user_id', $user->id)->first();
+
+            // Eager loading de 'user' et du 'wallet' principal pour optimiser les performances
+            $query = Customer::with(['user', 'wallets' => function ($query) {
+                $query->where('type', 'main');
+            }]);
+
+            // Barrière géographique : Un Admin Pays ne voit que les clients de son pays
+            if ($user->hasRole('country_admin') && $staff) {
+                $query->where('country_id', $staff->country_id);
+            }
+
+            // Recherche globale croisée (Nom, Prénom, Téléphone)
+            if ($request->has('search') && !empty($request->input('search'))) {
+                $search = $request->input('search');
+
+                if (is_numeric(preg_replace('/[^0-9]/', '', $search))) {
+                    $cleanPhone = clean_phone($search);
+                    $query->whereHas('user', function ($q) use ($cleanPhone) {
+                        $q->where('phone_number', 'LIKE', "%{$cleanPhone}%");
+                    });
+                } else {
+                    $query->whereHas('user', function ($q) use ($search) {
+                        $q->where('first_name', 'LIKE', "%{$search}%")
+                            ->orWhere('last_name', 'LIKE', "%{$search}%");
+                    });
+                }
+            }
+
+            // Filtrer par état de compte (Par défaut : comptes actifs)
+            $status = $request->input('status', 'active');
+            $query->where('status', $status);
+
+
+                $query = $query->orderBy('id', 'desc'); // RE-ASSIGNATION ICI
+
+            // Limitation pour l'autocomplétion UI
+            $customers = $query->whereHas('user')
+                ->limit(10)
+                ->get();
+
+            // Normalisation à plat (Correction des variables $customer vers $c)
+            $formatted = $customers->map(function ($c) {
+                return [
+                    'id'             => $c->id,
+                    'reference'      => $c->reference,
+                    'name'           => $c->user ? "{$c->user->first_name} {$c->user->last_name}" : 'N/A',
+                    'phone'          => $c->user ? $c->user->phone_number : 'N/A',
+                    'id_type'        => $c->id_type,
+                    'id_number'      => $c->id_number,
+                    'id_expiry_date' => $c->id_expiry_date,
+                    'email'          => $c->user ? $c->user->email : null,
+                    'kyc_status'     => $c->kyc_status,
+                    'status'         => $c->status,
+                    'wallet'         => $c->mainWallet ? [
+                        'wallet_number' => $c->mainWallet->wallet_number,
+                        'balance'       => (float) $c->mainWallet->balance,
+                    ] : null,
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'data'    => $formatted
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur lors de la recherche client : " . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => "Erreur lors de la recherche client : " . $e->getMessage()
+            ], 500);
+        }
+    }
 
     /**
      * ENREGISTRER UN NOUVEAU CLIENT AVEC VÉRIFICATION KYC (Au guichet).
      * Accessible par : merchant, cashier, manager.
+     * @param Request $request
+     * @return JsonResponse
      */
+
     public function store(Request $request): JsonResponse
     {
         $user = Auth::user();
         $staff = Staff::where('user_id', $user->id)->first();
 
+        // 1. Prétraitement des données (ex: nettoyage du téléphone avant validation)
+        if ($request->has('phone')) {
+            $request->merge(['phone' => clean_phone($request->input('phone'))]);
+        }
+
+        // 2. Validation des données
         $validated = $request->validate([
             // Données d'identité (Table Users)
-            'first_name'   => 'required|string|max:100',
-            'last_name'    => 'required|string|max:100',
-            'phone'        => 'required|string|unique:users,phone_number',
-            'email'        => 'nullable|email|unique:users,email',
+            'first_name'      => 'required|string|max:100',
+            'last_name'       => 'required|string|max:100',
+            'phone'           => 'required|string|unique:users,phone_number',
+            'email'           => 'nullable|email|unique:users,email',
             // Données KYC / Profil (Table Customers)
-            'id_type'      => 'required|string|in:CNI,PASSPORT,DRIVING_LICENSE,REFUGEE_CARD',
-            'id_number'    => 'required|string|max:50|unique:customers,id_number',
-            'id_expiry'    => 'required|date|after:today',
-            'dob'          => 'required|date|before:-18 years', // Protection légale de majorité
-            'address'      => 'nullable|string',
-            'country_id'   => 'required|exists:countries,id',
-            'city_id'      => 'required|exists:cities,id',
+            'id_type'         => 'required|string|in:CNI,PASSPORT,DRIVING_LICENSE,REFUGEE_CARD',
+            'id_number'       => 'required|string|max:50|unique:customers,id_number',
+            'id_expiry'       => 'required|date|after:today',
+            'dob'             => 'required|date|before:-18 years',
+            'address'         => 'nullable|string',
+            'country_id'      => 'required|exists:countries,id',
+            'city_id'         => 'required|exists:cities,id',
+            'initial_balance' => 'nullable|numeric|min:0',
         ]);
 
-        // Protection de juridiction pour l'agent de guichet
-        if ($user->hasRole('country_admin' ) || $user->hasRole('manager') || $user->hasRole('cashier')) {
+        // 3. Protection de juridiction territoriale pour l'agent
+        if ($user->hasAnyRole(['country_admin', 'manager', 'cashier'])) {
             if ($staff && (int)$validated['country_id'] !== (int)$staff->country_id) {
                 return response()->json([
                     'success' => false,
@@ -131,28 +220,43 @@ class CustomerController extends Controller
         }
 
         try {
-            return DB::transaction(function () use ($validated) {
+            // La transaction retourne directement la JsonResponse en cas de succès
+            return DB::transaction(function () use ($validated, $request) {
 
-                // 1. Création de l'entité centrale d'authentification
+                // Génération d'un username unique
+                $usernameBase = strtolower($validated['first_name'][0] . Str::slug($validated['last_name']));
+                $username = $usernameBase . rand(100, 999);
+                while (User::where('username', $username)->exists()) {
+                    $username = $usernameBase . rand(100, 999);
+                }
+
+                // 1. Création de l'utilisateur
                 $customerUser = User::create([
                     'uuid'         => (string) Str::uuid(),
-                    'username'     => strtolower($validated['first_name'][0] . Str::slug($validated['last_name']) . rand(100, 999)),
+                    'username'     => $username,
                     'first_name'   => strtoupper($validated['first_name']),
                     'last_name'    => ucwords(strtolower($validated['last_name'])),
-                    'phone_number' => clean_phone($validated['phone']),
+                    'phone_number' => $validated['phone'], // Déjà nettoyé via le merge()
                     'email'        => $validated['email'] ?? null,
-                    'password'     => Hash::make('Default@2026'), // Exigence de mot de passe temporaire
+                    'password'     => Hash::make('Default@2026'),
                     'is_active'    => true,
                 ]);
 
-                // Habilitation du rôle client
-                $customerUser->assignRole('customer');
+                // Assignation du rôle client (Spatie)
+                if (method_exists($customerUser, 'assignRole')) {
+                    $customerUser->assignRole('customer');
+                }
 
-                // 2. Création du profil KYC couplé
+                // Génération d'une référence client unique
+                do {
+                    $reference = 'CLI-' . strtoupper(Str::random(8));
+                } while (Customer::where('reference', $reference)->exists());
+
+                // 2. Création du profil KYC
                 $customer = Customer::create([
                     'uuid'           => (string) Str::uuid(),
                     'user_id'        => $customerUser->id,
-                    'reference'      => 'CLI-' . strtoupper(Str::random(8)),
+                    'reference'      => $reference,
                     'birth_date'     => $validated['dob'],
                     'id_type'        => $validated['id_type'],
                     'id_number'      => strtoupper($validated['id_number']),
@@ -160,28 +264,62 @@ class CustomerController extends Controller
                     'country_id'     => $validated['country_id'],
                     'city_id'        => $validated['city_id'],
                     'address'        => $validated['address'],
-                    'kyc_level'      => 'full', // Initialisation directe au guichet physique (Vérification de visu)
+                    'kyc_level'      => 'full',
                     'kyc_status'     => 'approved',
                     'status'         => 'active',
                 ]);
 
-                Log::info("KYC_ARCH: Client [{$customer->reference}] créé pour User [{$customerUser->id}]");
+                // Génération d'un numéro de portefeuille unique
+                do {
+                    $walletNumber = 'WLT-CLN-' . strtoupper(Str::random(10));
+                } while (Wallet::where('wallet_number', $walletNumber)->exists());
+
+                $initialBalance = (float) ($validated['initial_balance'] ?? 0);
+
+                // 3. Création du portefeuille
+                $wallet = Wallet::create([
+                    'uuid'          => (string) Str::uuid(),
+                    'owner_id'      => $customer->id,
+                    'owner_type'    => Customer::class,
+                    'wallet_number' => $walletNumber,
+                    'type'          => 'main',
+                    'currency'      => 'XAF', // Idéalement dynamique selon le pays/country_id
+                    'balance'       => $initialBalance,
+                    'is_active'     => true,
+                ]);
+
+                // 4. Traçabilité financière (Dépôt initial)
+                if ($initialBalance > 0) {
+                    // IMPORTANT : Logique d'écriture comptable (Débit/Crédit, CashOperation) à insérer ici
+                    // Ex: CashOperation::create([...]);
+                }
+
+                Log::info("KYC_ARCH: Client [{$customer->reference}] créé avec succès par l'agent [ID: Auth::id()].");
 
                 return response()->json([
                     'success' => true,
                     'message' => 'Profil client créé et validé avec succès au guichet.',
                     'data'    => [
-                        'user'     => $customerUser,
-                        'customer' => $customer
+                        'id'            => $customer->id,
+                        'reference'     => $customer->reference,
+                        'name'          => "{$customerUser->first_name} {$customerUser->last_name}",
+                        'phone'         => $customerUser->phone_number,
+                        'wallet_number' => $wallet->wallet_number,
+                        'balance'       => (float) $wallet->balance
                     ]
                 ], 201);
             });
 
-        } catch (Exception $e) {
+        } catch (\Exception $e) {
+            Log::error("Erreur immatriculation guichet : " . $e->getMessage(), [
+                'exception' => $e,
+                'agent_id'  => Auth::id()
+            ]);
+
             return response()->json([
                 'success' => false,
-                'message' => 'Erreur lors du traitement de l\'immatriculation : ' . $e->getMessage()
-            ], 422);
+                'message' => 'Erreur lors du traitement de l\'immatriculation. Veuillez réessayer.'
+            ], 500); // 500 est plus approprié pour une erreur serveur / exception inattendue
         }
     }
 

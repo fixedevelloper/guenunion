@@ -75,7 +75,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/cities/by/country', [CityController::class, 'getCityByCountry']);
 
         // Gestion des clients & Conformité KYC de premier niveau
-        Route::get('/customers', [CustomerController::class, 'index']);
+        Route::get('/customers', [CustomerController::class, 'customers']);
+        Route::get('/customers2', [CustomerController::class, 'index']);
         Route::post('/customers', [CustomerController::class, 'store']);
         Route::get('/customers/{uuid}', [CustomerController::class, 'show']);
         Route::get('/customers/reference/{reference}', [CustomerController::class, 'searchByReference']);
