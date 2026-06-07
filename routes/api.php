@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\CashOperationController;
 use App\Http\Controllers\Api\CityController;
 use App\Http\Controllers\Api\CommissionController;
 use App\Http\Controllers\Api\CountryController;
+use App\Http\Controllers\Api\customer\ChatController;
 use App\Http\Controllers\Api\customer\TransactionController;
 use App\Http\Controllers\Api\customer\WalletController;
 use App\Http\Controllers\Api\CustomerController;
@@ -28,6 +29,7 @@ use Illuminate\Support\Facades\Route;
 // ==========================================
 Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login'])->name('login')->middleware('throttle:login_throttle');
+    Route::post('/customer/login', [AuthController::class, 'loginCustomer'])->name('customerLogin')->middleware('throttle:login_throttle');
     Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
     Route::post('/reset-password', [AuthController::class, 'resetPassword']);
     Route::post('refresh', [AuthController::class, 'refresh']);
@@ -37,7 +39,7 @@ Route::prefix('auth')->group(function () {
         Route::post('verify', [AuthController::class, 'verifyOtp']);
     });
 });
-
+Route::get('/me/countries', [CountryController::class, 'countries']);
 // ==========================================
 // ROUTES SÉCURISÉES (Authentification Sanctum)
 // ==========================================
@@ -54,13 +56,31 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::post('/remittance/estimate-fees', [RemittanceController::class, 'estimateFees']);
 
     Route::middleware(['role:customer'])->group(function () {
-        Route::get('/me/countries', [CountryController::class, 'countries']);
         Route::get('/me/transactions', [TransactionController::class, 'index']);
+        Route::get('/me/transactions/{id}', [TransactionController::class, 'show']);
         Route::get('/me/wallets', [WalletController::class, 'index']);
+        Route::get('/me/customers/verify/{phone}', [CustomerController::class, 'verifyCustomer']);
         Route::get('/customers/me', [CustomerController::class, 'showMe']);
         Route::put('/customers/me', [CustomerController::class, 'update']); // PUT ou PATCH selon ta préférence
         Route::get('/me/remittance/estimate-fees', [TransactionController::class, 'estimateFees']);
         Route::post('/me/transactions', [TransactionController::class, 'makeTransaction']);
+        Route::post('/me/transfers', [TransactionController::class, 'makeWalletTransaction']);
+    });
+    // ── 💬 GESTION DES CONVERSATIONS (SALONS) ───────────────────────────────
+    Route::prefix('me/conversations')->group(function () {
+
+        // ⚡ 1. Récupérer ou Créer un salon avec un contact (Id de l'utilisateur cible)
+        Route::post('{contact_id}', [ChatController::class, 'createOrGetConversation']);
+
+        // 📖 2. Charger l'historique des messages d'une conversation spécifique
+        Route::get('{conversation_id}/messages', [ChatController::class, 'getMessages']);
+
+        // 📤 3. Envoyer un message dans une conversation (Supporte le texte et le Multipart pour les images)
+        Route::post('{conversation_id}/messages', [ChatController::class, 'sendMessage']);
+
+        // 📜 4. Optionnel : Récupérer la liste de toutes mes discussions en cours (pour l'écran d'accueil du chat)
+        Route::get('/', [ChatController::class, 'getMyConversations']);
+
     });
     /*
      |--------------------------------------------------------------------------

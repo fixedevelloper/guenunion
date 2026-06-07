@@ -454,9 +454,6 @@ class CustomerController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-    /**
-     * HISTORIQUE DES DEMANDES DE VÉRIFICATION KYC (Back-office Conformité).
-     */
     public function kycSubmissions(Request $request): JsonResponse
     {
         try {
@@ -608,8 +605,11 @@ class CustomerController extends Controller
             'message' => 'Le dossier de conformité KYC a été traité avec succès.'
         ], 200);
     }
+
     /**
      * Récupérer le profil du client connecté.
+     * @param Request $request
+     * @return JsonResponse
      */
     public function showMe(Request $request): JsonResponse
     {
@@ -629,6 +629,46 @@ class CustomerController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'Profil client récupéré avec succès.',
+                'data' => $customer
+            ], 200);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération du profil.',
+                'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Récupérer le profil du client connecté.
+     * @param Request $request
+     * @return JsonResponse
+     */
+    public function verifyCustomer(Request $request, $phone): JsonResponse
+    {
+        try {
+            // 🛠️ Correction de la typo: 'fisrt()' -> 'first()'
+            // Remplacement de 'phone_number' par votre colonne réelle (souvent 'phone' ou 'phone_number')
+            $user = User::query()->where('phone_number', $phone)->first();
+            $customer=$user->customer;
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Profil client introuvable.'
+                ], 404);
+            }
+
+            // Charger la relation 'user' pour récupérer le nom/prénom si nécessaire
+            $customer->load('user');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profil client récupéré avec succès.',
+                // 🔥 Si votre ApiResponse Android attend un format { success, message, data: { data: { ... } } }
+                // décommentez la ligne suivante pour l'aligner avec votre submitTransfer :
+                // 'data' => ['data' => $customer]
                 'data' => $customer
             ], 200);
 

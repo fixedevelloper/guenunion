@@ -94,6 +94,83 @@ class AuthController extends Controller
         }
     }
 
+    public function loginCustomer(Request $request): JsonResponse
+    {
+        $request->validate([
+            'phone'    => 'required|string',
+            'password' => 'required|string',
+        ]);
+
+        try {
+            $cleanPhone = clean_phone($request->input('phone'));
+
+            // 🚀 Optimisation Performance : Eager loading immédiat du profil client et de ses relations
+            $user = User::where('phone_number', $cleanPhone)
+                ->with(['customer.user'])
+                ->first();
+
+            // 🔒 Sécurité : Vérification uniforme pour contrer les attaques par analyse de temps (Timing Attacks)
+            if (!$user || !Hash::check($request->password, $user->password)) {
+                // Sécurité : On ne logue l'essai que si l'utilisateur existe pour éviter les écritures DB inutiles lors de scans massifs
+                if ($user) {
+                    $this->logLoginAttempt($user, $request, 'failed', 'invalid_credentials');
+                }
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Identifiants incorrects.'
+                ], 401);
+            }
+
+            // 2. Vérification du statut d'activité du compte central
+            if (!$user->is_active) {
+                $this->logLoginAttempt($user, $request, 'failed', 'suspended_account');
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Compte suspendu ou inactif.'
+                ], 403);
+            }
+
+            // 3. Vérification de l'existence du profil client associé
+            $customer = $user->customer;
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Ce compte utilisateur n'a pas de profil client associé."
+                ], 404);
+            }
+
+            // 4. Sécurité de session unique : Révocation des jetons précédents (Anti-simultané)
+            $user->tokens()->delete();
+
+            // 5. Génération du nouveau jeton d'accès Sanctum
+            $token = $user->createToken('auth_token')->plainTextToken;
+
+            // 6. Enregistrement de l'historique de succès
+            $this->logLoginAttempt($user, $request, 'success', null, null);
+
+            // 7. Retourner la réponse formattée (Exactement calquée sur votre AuthResponse en Kotlin)
+            return response()->json([
+                'success' => true,
+                'message' => 'Authentification réussie.',
+                'data' => [
+                    'access_token' => $token,
+                    'token_type'   => 'Bearer',
+                    'customer'     => $customer // Déjà chargé de manière optimale avec 'user' inclus
+                ]
+            ], 200);
+
+        } catch (Exception $e) {
+            Log::error("Erreur critique lors de la tentative de login : " . $e->getMessage(), [
+                'phone' => $request->input('phone'),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Une erreur interne est survenue.'
+            ], 500);
+        }
+    }
     /**
      * Méthode helper cloisonnée pour tracer les logs d'accès.
      */
@@ -126,7 +203,7 @@ class AuthController extends Controller
         return response()->json([
             'success' => true,
             'message' => 'Profil utilisateur récupéré.',
-            'data' => $user
+            'data' => $user->customer
         ], 200);
     }
     /**
