@@ -13,6 +13,7 @@ use App\Models\Wallet;
 use App\Services\FraudCheckService;
 use App\Services\LedgerService;
 use App\Services\RemittanceService;
+use Barryvdh\DomPDF\Facade\Pdf;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
@@ -690,4 +691,34 @@ class TransactionController extends Controller
         default => '******',
     };
 }
+    /**
+     * Générer le reçu PDF de la transaction
+     */
+    public function downloadReceipt1($id)
+    {
+        // Récupération de la transaction (sécurise avec auth() si nécessaire)
+        $transaction = Transaction::findOrFail($id);
+
+        // 1. Charger la vue HTML en injectant la variable $transaction
+        $pdf = Pdf::loadView('pdf.receipt', compact('transaction'));
+
+        // Optionnel : Configurer le format du papier (ex: A4 ou ticket de caisse thermique)
+        $pdf->setPaper('a4', 'portrait');
+
+        // 2. Option A : Téléchargement direct (Force le téléchargement du fichier)
+        // return $pdf->download("recu_{$transaction->reference}.pdf");
+
+        // 3. Option B : Affichage direct dans le navigateur / application (Recommandé pour mobile)
+        return $pdf->stream("recu_{$transaction->reference}.pdf");
+    }
+    public function downloadReceipt($id)
+    {
+        $transaction = Transaction::findOrFail($id);
+        $pdf = Pdf::loadView('pdf.receipt', compact('transaction'));
+
+        // On force le rendu et on retourne la réponse en mode téléchargement (attachment)
+        return response($pdf->output(), 200)
+            ->header('Content-Type', 'application/pdf')
+            ->header('Content-Disposition', 'attachment; filename="recu_'.$transaction->reference.'.pdf"');
+    }
 }

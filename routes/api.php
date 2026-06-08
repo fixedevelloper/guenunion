@@ -39,6 +39,7 @@ Route::prefix('auth')->group(function () {
         Route::post('verify', [AuthController::class, 'verifyOtp']);
     });
 });
+Route::get('/transactions/{id}/receipt', [TransactionController::class, 'downloadReceipt'])->name('transactions.receipt');
 Route::get('/me/countries', [CountryController::class, 'countries']);
 // ==========================================
 // ROUTES SÉCURISÉES (Authentification Sanctum)
