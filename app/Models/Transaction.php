@@ -34,6 +34,8 @@ class Transaction extends Model
         'recipient_email',
         'source_agency_id',
         'destination_agency_id',
+        'source_till_id',
+        'destination_till_id',
         'sender_country_id',
         'sender_city_id',
         'recipient_country_id',

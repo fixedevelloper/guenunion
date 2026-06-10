@@ -31,6 +31,21 @@ class UserAndRoleSeeder extends Seeder
                 $this->command->error("Erreur : Les données géographiques de base (CM - Douala) doivent être injectées par CountryAndCitySeeder avant d'exécuter ce seeder.");
                 return;
             }
+                        Wallet::firstOrCreate(
+                            [
+                                'owner_id'   => $country->id,
+                                'owner_type' => Country::class, // Morphisme vers l'agence
+                                'type'       => 'main',        // Type principal pour les opérations de caisse
+                            ],
+                            [
+                                'uuid'          => (string) Str::uuid(),
+                                'wallet_number' => 'WLT-CTR-' . $country->code . '-01', // Numéro de portefeuille unique et traçable
+                                'currency'      => 'XAF',
+                                'balance'       => 0.00,
+                                'is_active'     => true,
+                                'ledger_hash'   => null, // Sera calculé lors de la première transaction
+                            ]
+                        );
 
             // 2. CONFIGURATION DE L'AGENCE DE TEST (Douala Centre)
             $agency = Agency::firstOrCreate(

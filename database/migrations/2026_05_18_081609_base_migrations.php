@@ -232,7 +232,7 @@ return new class extends Migration
                 'peer_to_peer',
                 'commission',
                 'adjustment',
-                'refund'
+                'refund','vault_to_till','till_to_vault','country_to_agency','agency_to_country'
             ]);
             $table->enum('status', ['initiated', 'processing', 'completed', 'paid', 'failed', 'reversed', 'cancelled'])->default('initiated');
             $table->decimal('amount', 18, 2);
@@ -250,6 +250,8 @@ return new class extends Migration
 
             $table->foreignId('source_agency_id')->nullable()->constrained('agencies')->restrictOnDelete();
             $table->foreignId('destination_agency_id')->nullable()->constrained('agencies')->restrictOnDelete();
+            $table->foreignId('source_till_id')->nullable()->constrained('tills')->restrictOnDelete();
+            $table->foreignId('destination_till_id')->nullable()->constrained('tills')->restrictOnDelete();
             $table->foreignId('sender_country_id')->nullable()->constrained('countries')->restrictOnDelete();
             $table->foreignId('sender_city_id')->nullable()->constrained('cities')->restrictOnDelete();
             $table->foreignId('recipient_country_id')->nullable()->constrained('countries')->restrictOnDelete();

@@ -32,8 +32,8 @@ class CashOperationController extends Controller
         try {
             $user = Auth::user();
 
-            // 1. Extraction du profil staff (via la table 'staff')
-            $staff = Staff::with('agency.country')->where('user_id', $user->id)->first();
+            // 1. Extraction du profil staff avec l'agence et le guichet ACTUELlement ouvert
+            $staff = Staff::with(['agency.country', 'currentTill'])->where('user_id', $user->id)->first();
 
             if (!$staff || !$staff->agency) {
                 return response()->json([
@@ -45,24 +45,16 @@ class CashOperationController extends Controller
             $agency = $staff->agency;
             $till = null;
 
-            // 2. Récupération de la caisse ciblée
+            // 2. Priorité à la caisse passée en paramètre, sinon on utilise la caisse active issue de la relation
             $tillId = $request->query('till_id');
 
             if ($tillId) {
                 $till = Till::where('id', $tillId)->where('agency_id', $agency->id)->first();
             } else {
-                $lastOpeningOp = CashOperation::where('agency_id', $agency->id)
-                    ->where('staff_id', $staff->id)
-                    ->where('type', 'opening')
-                    ->orderByDesc('id')
-                    ->first();
-
-                if ($lastOpeningOp) {
-                    $till = Till::find($lastOpeningOp->till_id);
-                }
+                $till = $staff->currentTill; // Utilisation directe de la relation hasOneThrough optimisée
             }
 
-            // Si aucune caisse n'est trouvée ou traçable dans l'historique de l'agent
+            // Si aucune caisse n'est assignée/ouverte ou si le paramètre till_id était invalide
             if (!$till) {
                 return response()->json([
                     'success' => true,
@@ -75,23 +67,19 @@ class CashOperationController extends Controller
                 ], 200);
             }
 
-            // 3. Récupération du solde depuis le portefeuille polymorphe principal du guichet
+            // 3. Récupération du solde comptable depuis le portefeuille virtuel du guichet
             $tillWallet = Wallet::where('owner_id', $till->id)
                 ->where('owner_type', Till::class)
                 ->where('type', 'main')
                 ->first();
 
+            // On privilégie le solde virtuel du Ledger, sinon le solde physique du coffre de caisse
             $currentBalance = $tillWallet ? (float) $tillWallet->balance : (float) $till->current_balance;
 
-            // 🔍 ANALYSE DU JOURNAL DE CETTE CAISSE SPÉCIFIQUE
-            $lastCycleOperation = CashOperation::where('till_id', $till->id)
-                ->whereIn('type', ['opening', 'closing'])
-                ->orderByDesc('id')
-                ->first();
-
-            $isOpen = $lastCycleOperation
-                && $lastCycleOperation->type === 'opening'
-                && $lastCycleOperation->staff_id === $staff->id;
+            // 4. Détermination fine du statut d'ouverture
+            // Si le guichet provient de 'currentTill', il est par définition ouvert et actif.
+            // Si un 'till_id' spécifique a été forcé, on vérifie ses attributs natifs.
+            $isOpen = ($till->status === 'open' && $till->is_active);
 
             return response()->json([
                 'success' => true,
@@ -101,7 +89,8 @@ class CashOperationController extends Controller
                     'till_id'         => $till->id,
                     'till_name'       => $till->name,
                     'till_code'       => $till->code,
-                    'current_balance' => $currentBalance,
+                    'current_balance' => $currentBalance, // Position comptable
+                    'physical_balance'=> (float) $till->current_balance, // Cash physique dans le tiroir
                     'currency'        => $agency->country->currency_code ?? 'XAF',
                     'user'            => [
                         'name'  => $user->name,

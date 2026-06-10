@@ -21,7 +21,7 @@ class Country extends Model
     protected $fillable = [
         'code',         // Code ISO unique à 2 lettres (ex: CM, CG, GA)
         'name',         // Nom officiel du pays (ex: Cameroun)
-        'currency',     // Devise locale unifiée ou spécifique (ex: XAF)
+        'currency_code',     // Devise locale unifiée ou spécifique (ex: XAF)
         'phone_prefix', // Préfixe téléphonique international sans le '+' (ex: 237, 242)
         'is_active',    // Statut d'ouverture du pays pour le réseau de transfert
     ];
@@ -89,5 +89,13 @@ class Country extends Model
     public function scopeActive($query)
     {
         return $query->where('is_active', true);
+    }
+    /**
+     * Obtenir le portefeuille principal unique du pays.
+     */
+    public function mainWallet()
+    {
+        return $this->morphOne(Wallet::class, 'owner')
+            ->where('type', 'main');
     }
 }

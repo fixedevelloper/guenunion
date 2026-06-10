@@ -98,4 +98,13 @@ class User extends Authenticatable
     {
         return $this->hasMany(LoginHistory::class, 'user_id');
     }
+    public function isSupervisor(): bool
+    {
+        return $this->hasRole('manager');
+    }
+
+    public function isCountryAdmin(): bool
+    {
+        return $this->hasRole('country_admin');
+    }
 }

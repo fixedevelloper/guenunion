@@ -1,7 +1,12 @@
 <?php
 
-use App\Http\Controllers\Api\AgencyAnalyticsController;use App\Http\Controllers\Api\AgencyController;
-use App\Http\Controllers\Api\AgencyReportController;use App\Http\Controllers\Api\AgencyTillController;use App\Http\Controllers\Api\AgencyTransactionController;use App\Http\Controllers\Api\AgencyVaultController;use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\AgencyAnalyticsController;
+use App\Http\Controllers\Api\AgencyController;
+use App\Http\Controllers\Api\AgencyReportController;
+use App\Http\Controllers\Api\AgencyTillController;
+use App\Http\Controllers\Api\AgencyTransactionController;
+use App\Http\Controllers\Api\AgencyVaultController;
+use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\CashierSessionController;
 use App\Http\Controllers\Api\CashOperationController;
 use App\Http\Controllers\Api\CityController;
@@ -16,6 +21,8 @@ use App\Http\Controllers\Api\RemittanceController;
 use App\Http\Controllers\Api\ReportingController;
 use App\Http\Controllers\Api\StaffController;
 use App\Http\Controllers\Api\TransferController;
+use App\Http\Controllers\Api\VaultTransferController;
+use App\Http\Controllers\CashInController;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -55,7 +62,28 @@ Route::middleware(['auth:sanctum'])->group(function () {
      |--------------------------------------------------------------------------
      */
     Route::post('/remittance/estimate-fees', [RemittanceController::class, 'estimateFees']);
+    // =========================================================================
+    // ROUTES DE TRÉSORERIE UNIFIÉES (Vault & Till Transfers)
+    // =========================================================================
+    Route::prefix('vault-transfers')->group(function () {
 
+        // 1. Initialiser une demande (Accessible par les caissiers et superviseurs)
+        Route::post('/', [VaultTransferController::class, 'store']);
+
+        // 2. Annuler sa propre demande tant qu'elle est en attente
+        Route::delete('/{id}/cancel', [VaultTransferController::class, 'cancel']);
+
+        // 3. Récupérer le listing adaptatif selon le rôle (Demandes en attente)
+        Route::get('/pending', [VaultTransferController::class, 'pendingRequests']);
+
+        // 4. Consulter l'historique des flux archivés (Approuvés / Rejetés)
+        Route::get('/history', [VaultTransferController::class, 'history']);
+
+        // 5. Traiter une demande (Approuver ou Rejeter)
+        // Note : Le contrôleur valide en interne si c'est un superviseur ou un country_admin
+        Route::post('/{id}/process', [VaultTransferController::class, 'process']);
+
+    });
     Route::middleware(['role:customer'])->group(function () {
         Route::get('/me/transactions', [TransactionController::class, 'index']);
         Route::get('/me/transactions/{id}', [TransactionController::class, 'show']);
@@ -121,6 +149,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
         ///transfer
         Route::get('cash/transfer/fees/calculate', [TransferController::class, 'calculateFees']);
         Route::post('/cash/transfer/execute', [TransferController::class, 'execute']);
+        Route::post('/cash/cash-in/execute', [CashInController::class, 'execute']);
+        Route::post('/cash/cash-out/execute', [CashInController::class, 'executeCashOut']);
     });
 
     /*
@@ -152,6 +182,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/logs/connections', [ReportingController::class, 'historyLogs']);
         Route::get('/commissions', [CommissionController::class, 'index']);
         Route::get('/accounting/preview', [ReportingController::class, 'previewDocument']);
+
+
     });
 
     /*
@@ -194,15 +226,12 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/countries/{countryUuid}/cities', [CityController::class, 'store']);
         Route::patch('/cities/{uuid}/toggle', [CityController::class, 'toggleStatus']);
 
-       // Gestion du personnel (Staff) de l'ensemble du réseau
-       // Route::get('/staff', [StaffController::class, 'index']);
-        //Route::get('/staff/dependencies', [StaffController::class, 'dependencies']);
-       // Route::post('/staff', [StaffController::class, 'store']);
+        Route::post('/countries/{uuid}/adjust-wallet', [CountryController::class, 'adjustWallet']);
         Route::patch('/staff/{uuid}/toggle', [StaffController::class, 'toggleStatus']);
 
         // Création et activation des implantations d'agences
         Route::get('/agencies/dependencies', [AgencyController::class, 'dependencies']);
-       // Route::post('/agencies', [AgencyController::class, 'store']);
+        // Route::post('/agencies', [AgencyController::class, 'store']);
         Route::patch('/agencies/{uuid}/toggle', [AgencyController::class, 'toggleStatus']);
 
         Route::get('/fees', [FeesTableController::class, 'index']);

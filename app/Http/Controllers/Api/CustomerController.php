@@ -5,9 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Customer;
 use App\Models\Transaction;
+use App\Models\TransactionEntry;
 use App\Models\User;
 use App\Models\Staff;
 use App\Models\Wallet;
+use App\Services\LedgerService;
 use Exception;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -19,6 +21,16 @@ use Illuminate\Support\Str;
 
 class CustomerController extends Controller
 {
+    protected LedgerService $ledgerService;
+
+    /**
+     * Injection du LedgerService pour sécuriser cryptographiquement les mouvements de coffre.
+     * @param LedgerService $ledgerService
+     */
+    public function __construct(LedgerService $ledgerService)
+    {
+        $this->ledgerService = $ledgerService;
+    }
     /**
      * RECHERCHE PRÉDICTIVE / FILTRE DES CLIENTS (Pour le guichet de caisse).
      * Accessible par : merchant, cashier, manager, country_admin, super_admin.
@@ -180,83 +192,291 @@ class CustomerController extends Controller
      * @param Request $request
      * @return JsonResponse
      */
-
     public function store(Request $request): JsonResponse
     {
         $user = Auth::user();
         $staff = Staff::where('user_id', $user->id)->first();
 
-        // 1. Prétraitement des données (ex: nettoyage du téléphone avant validation)
+        // Récupération sécurisée du Till actif via la relation
+        $till = $staff?->currentTill;
+
+    // 1. Prétraitement des données
+    if ($request->has('phone')) {
+        $request->merge(['phone' => clean_phone($request->input('phone'))]);
+    }
+
+    // 2. Validation des données
+    $validated = $request->validate([
+        'first_name'      => 'required|string|max:100',
+        'last_name'       => 'required|string|max:100',
+        'phone'           => 'required|string|unique:users,phone_number',
+        'email'           => 'nullable|email|unique:users,email',
+        'id_type'         => 'required|string|in:CNI,PASSPORT,DRIVING_LICENSE,REFUGEE_CARD',
+        'id_number'       => 'required|string|max:50|unique:customers,id_number',
+        'id_expiry'       => 'required|date|after:today',
+        'dob'             => 'required|date|before:-18 years',
+        'address'         => 'nullable|string',
+        'country_id'      => 'required|exists:countries,id',
+        'city_id'         => 'required|exists:cities,id',
+        'initial_balance' => 'nullable|numeric|min:0',
+    ]);
+
+    // 3. Protection de juridiction territoriale stricte pour l'agent
+    if ($user->hasAnyRole(['country_admin', 'manager', 'cashier'])) {
+        if (!$staff) {
+            return response()->json([
+                'success' => false,
+                'message' => "Action refusée : Aucun profil d'opérateur valide associé à votre compte."
+            ], 403);
+        }
+
+        if ((int)$validated['country_id'] !== (int)$staff->country_id) {
+            return response()->json([
+                'success' => false,
+                'message' => "Action interdite : Vous ne pouvez pas immatriculer un client en dehors de votre pays d'affectation."
+            ], 403);
+        }
+    }
+
+    // Garde-fou de sécurité : Si dépôt initial demandé, la présence d'une caisse est obligatoire
+    $initialBalance = (float) ($validated['initial_balance'] ?? 0);
+    if ($initialBalance > 0 && !$till) {
+        return response()->json([
+            'success' => false,
+            'message' => "Opération impossible : Vous devez être assigné à une caisse/guichet active pour percevoir un dépôt initial."
+        ], 422);
+    }
+
+    try {
+        // Isolation de la transaction au niveau REPEATABLE READ ou SERIALIZABLE si nécessaire pour la compta
+        return DB::transaction(function () use ($till, $validated, $user, $staff, $initialBalance) {
+
+            $cashierWallet = null;
+
+            if ($initialBalance > 0) {
+                // Verrouillage pessimiste immédiat de la caisse pour éviter la double dépense concourante
+                $cashierWallet = Wallet::where('owner_type', 'App\Models\Till')
+                    ->where('owner_id', $till->id)
+                    ->where('type', 'main')
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$cashierWallet || !$cashierWallet->is_active) {
+                    throw new \Exception("Votre coffre/guichet physique est introuvable, suspendu ou non initialisé.", 422);
+                }
+
+                // Barrière de Sécurité Financière : Vérification de la provision de la caisse
+                if ((float)$cashierWallet->balance < $initialBalance) {
+                    throw new \Exception("Fonds insuffisants dans votre encaisse de guichet pour valider cette dotation.", 422);
+                }
+            }
+
+            // Déplacement de la génération des identifiants uniques DANS la transaction (Réduction des Race Conditions)
+            $usernameBase = strtolower($validated['first_name'][0] . Str::slug($validated['last_name']));
+            $username = $usernameBase . rand(100, 999);
+            while (User::where('username', $username)->exists()) {
+                $username = $usernameBase . rand(100, 999);
+            }
+
+            // 1. Création de l'utilisateur sécurisé
+            $customerUser = User::create([
+                'uuid'         => (string) Str::uuid(),
+                'username'     => $username,
+                'first_name'   => strtoupper($validated['first_name']),
+                'last_name'    => ucwords(strtolower($validated['last_name'])),
+                'phone_number' => $validated['phone'],
+                'email'        => $validated['email'] ?? null,
+                'password'     => Hash::make('Default@2026'), // Exiger un reset au premier login
+                'is_active'    => true,
+            ]);
+
+            if (method_exists($customerUser, 'assignRole')) {
+                $customerUser->assignRole('customer');
+            }
+
+            // Génération d'une référence client unique
+            do {
+                $reference = 'CLI-' . strtoupper(Str::random(8));
+            } while (Customer::where('reference', $reference)->exists());
+
+            // 2. Création du profil KYC approuvé au guichet
+            $customer = Customer::create([
+                'uuid'           => (string) Str::uuid(),
+                'user_id'        => $customerUser->id,
+                'reference'      => $reference,
+                'birth_date'     => $validated['dob'],
+                'id_type'        => $validated['id_type'],
+                'id_number'      => strtoupper($validated['id_number']),
+                'id_expiry_date' => $validated['id_expiry'],
+                'country_id'     => $validated['country_id'],
+                'city_id'        => $validated['city_id'],
+                'address'        => $validated['address'],
+                'kyc_level'      => 'full',
+                'kyc_status'     => 'approved',
+                'status'         => 'active',
+            ]);
+
+            // Génération d'un numéro de portefeuille unique
+            do {
+                $walletNumber = 'WLT-CLN-' . strtoupper(Str::random(10));
+            } while (Wallet::where('wallet_number', $walletNumber)->exists());
+
+            // 3. Création du portefeuille du client
+            $customerWallet = Wallet::create([
+                'uuid'          => (string) Str::uuid(),
+                'owner_id'      => $customer->id,
+                'owner_type'    => Customer::class,
+                'wallet_number' => $walletNumber,
+                'type'          => 'main',
+                'currency'      => $cashierWallet ? $cashierWallet->currency : 'XAF',
+                'balance'       => 0.00,
+                'is_active'     => true,
+            ]);
+
+            // 4. Traçabilité financière hermétique (Double-entrée comptable)
+            if ($initialBalance > 0 && $cashierWallet) {
+
+                $txReference = 'TX-INIT-' . now()->format('Ymd') . '-' . strtoupper(Str::random(6));
+
+                // A. Création de la transaction parente scellée
+                $transaction = Transaction::create([
+                    'uuid'         => (string) Str::uuid(),
+                    'reference'    => $txReference,
+                    'type'         => 'cash_in',
+                    'status'       => 'initiated',
+                    'amount'       => $initialBalance,
+                    'fees'         => 0,
+                    'taxes'        => 0,
+                    'currency'     => $customerWallet->currency,
+                    'initiator_id' => $user->id,
+                        'source_till_id'        => $till->id,
+                    'description'  => "Dotation initiale de fonds à la création du compte via guichet #{$till->id}.",
+                    'metadata'     => [
+                        'channel'            => 'guichet',
+                        'till_uuid'          => $till?->uuid ?? null,
+                        'customer_reference' => $customer->reference
+                    ]
+                ]);
+
+                $cashierBalanceBefore = (float) $cashierWallet->balance;
+                $customerBalanceBefore = (float) $customerWallet->balance;
+
+                // Application stricte des écritures
+                $cashierWallet->decrement('balance', $initialBalance);
+                $customerWallet->increment('balance', $initialBalance);
+
+                // B. Grand Livre : Écriture Débit Caisse (Sortie de provision virtuelle contre Cash Physique reçu)
+                // Éviter ->fresh() inutile car decrement/increment hydratent déjà l'objet en mémoire
+                $cashierSignature = $this->ledgerService->generateSignature(
+                    $cashierWallet->id, $initialBalance, 'debit', $cashierBalanceBefore, (float) $cashierWallet->balance
+                );
+                TransactionEntry::create([
+                    'uuid'           => (string) Str::uuid(),
+                    'transaction_id' => $transaction->id,
+                    'wallet_id'      => $cashierWallet->id,
+                    'entry_type'     => 'debit',
+                    'amount'         => $initialBalance,
+                    'balance_before' => $cashierBalanceBefore,
+                    'balance_after'  => $cashierWallet->balance,
+                    'row_signature'  => $cashierSignature
+                ]);
+
+                // Grand Livre : Écriture Crédit Compte Client
+                $customerSignature = $this->ledgerService->generateSignature(
+                    $customerWallet->id, $initialBalance, 'credit', $customerBalanceBefore, (float) $customerWallet->balance
+                );
+                TransactionEntry::create([
+                    'uuid'           => (string) Str::uuid(),
+                    'transaction_id' => $transaction->id,
+                    'wallet_id'      => $customerWallet->id,
+                    'entry_type'     => 'credit',
+                    'amount'         => $initialBalance,
+                    'balance_before' => $customerBalanceBefore,
+                    'balance_after'  => $customerWallet->balance,
+                    'row_signature'  => $customerSignature
+                ]);
+
+                // C. Mutation définitive du statut de la transaction
+                $transaction->update([
+                    'status'       => 'completed',
+                    'completed_at' => now()
+                ]);
+            }
+
+         //   Log::info("KYC_SECURE_ARCH: Client [{$customer->reference}] enregistré. Opérateur [ID: {$user->id}] au guichet [#{$till?->id ?? 'N/A'}]. Trésorerie synchronisée.");
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profil client créé et validé avec succès au guichet.',
+                'data'    => [
+                    'id'            => $customer->id,
+                    'reference'     => $customer->reference,
+                    'name'          => "{$customerUser->first_name} {$customerUser->last_name}",
+                    'phone'         => $customerUser->phone_number,
+                    'wallet_number' => $customerWallet->wallet_number,
+                    'balance'       => (float) $customerWallet->balance
+                ]
+            ], 201);
+        });
+
+    } catch (\Exception $e) {
+        Log::critical("ÉCHEC CRITIQUE IMMATRICULATION GUICHET : " . $e->getMessage(), [
+            'operator_id' => Auth::id(),
+            'till_id'     => $till?->id ?? 'Aucun',
+            'payload'     => $request->except(['password']),
+            'trace'       => $e->getTraceAsString()
+        ]);
+
+        // Transtypage explicite (int) pour blinder la comparaison du code d'erreur
+        return response()->json([
+            'success' => false,
+            'message' => (int)$e->getCode() === 422 ? $e->getMessage() : 'Une erreur de sécurité ou de conformité système bloque l\'immatriculation.'
+        ], 422);
+    }
+}
+    public function update(Request $request, string $uuid): JsonResponse
+    {
+             // 1. Récupération du client et de son utilisateur associé via l'UUID du profil Customer
+        $customer = Customer::where('uuid', $uuid)->first();
+        if (!$customer) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Client introuvable.'
+            ], 404);
+        }
+        $customerUser = $customer->user;
+
+        // 2. Prétraitement des données (nettoyage du téléphone)
         if ($request->has('phone')) {
             $request->merge(['phone' => clean_phone($request->input('phone'))]);
         }
 
-        // 2. Validation des données
+        // 3. Validation des données (avec exclusion des IDs actuels pour les règles uniques)
         $validated = $request->validate([
             // Données d'identité (Table Users)
-            'first_name'      => 'required|string|max:100',
-            'last_name'       => 'required|string|max:100',
-            'phone'           => 'required|string|unique:users,phone_number',
-            'email'           => 'nullable|email|unique:users,email',
+            'first_name' => 'required|string|max:100',
+            'last_name'  => 'required|string|max:100',
+            'phone'      => 'required|string|unique:users,phone_number,' . $customerUser->id,
+            'email'      => 'nullable|email|unique:users,email,' . $customerUser->id,
             // Données KYC / Profil (Table Customers)
-            'id_type'         => 'required|string|in:CNI,PASSPORT,DRIVING_LICENSE,REFUGEE_CARD',
-            'id_number'       => 'required|string|max:50|unique:customers,id_number',
-            'id_expiry'       => 'required|date|after:today',
-            'dob'             => 'required|date|before:-18 years',
-            'address'         => 'nullable|string',
-            'country_id'      => 'required|exists:countries,id',
-            'city_id'         => 'required|exists:cities,id',
-            'initial_balance' => 'nullable|numeric|min:0',
+            'dob'        => 'required|date|before:-18 years',
+            'address'    => 'nullable|string',
+            'city_id'    => 'required|exists:cities,id',
         ]);
 
-        // 3. Protection de juridiction territoriale pour l'agent
-        if ($user->hasAnyRole(['country_admin', 'manager', 'cashier'])) {
-            if ($staff && (int)$validated['country_id'] !== (int)$staff->country_id) {
-                return response()->json([
-                    'success' => false,
-                    'message' => "Action interdite : Vous ne pouvez pas immatriculer un client en dehors de votre pays d'affectation."
-                ], 403);
-            }
-        }
-
         try {
-            // La transaction retourne directement la JsonResponse en cas de succès
-            return DB::transaction(function () use ($validated, $request) {
+            return DB::transaction(function () use ($validated, $customer, $customerUser) {
 
-                // Génération d'un username unique
-                $usernameBase = strtolower($validated['first_name'][0] . Str::slug($validated['last_name']));
-                $username = $usernameBase . rand(100, 999);
-                while (User::where('username', $username)->exists()) {
-                    $username = $usernameBase . rand(100, 999);
-                }
-
-                // 1. Création de l'utilisateur
-                $customerUser = User::create([
-                    'uuid'         => (string) Str::uuid(),
-                    'username'     => $username,
+                // 1. Mise à jour de l'utilisateur (Identité)
+                $customerUser->update([
                     'first_name'   => strtoupper($validated['first_name']),
                     'last_name'    => ucwords(strtolower($validated['last_name'])),
-                    'phone_number' => $validated['phone'], // Déjà nettoyé via le merge()
+                    'phone_number' => $validated['phone'],
                     'email'        => $validated['email'] ?? null,
-                    'password'     => Hash::make('Default@2026'),
-                    'is_active'    => true,
                 ]);
 
-                // Assignation du rôle client (Spatie)
-                if (method_exists($customerUser, 'assignRole')) {
-                    $customerUser->assignRole('customer');
-                }
-
-                // Génération d'une référence client unique
-                do {
-                    $reference = 'CLI-' . strtoupper(Str::random(8));
-                } while (Customer::where('reference', $reference)->exists());
-
-                // 2. Création du profil KYC
-                $customer = Customer::create([
-                    'uuid'           => (string) Str::uuid(),
-                    'user_id'        => $customerUser->id,
-                    'reference'      => $reference,
+                // 2. Mise à jour du profil KYC
+                $customer->update([
                     'birth_date'     => $validated['dob'],
                     'id_type'        => $validated['id_type'],
                     'id_number'      => strtoupper($validated['id_number']),
@@ -264,62 +484,38 @@ class CustomerController extends Controller
                     'country_id'     => $validated['country_id'],
                     'city_id'        => $validated['city_id'],
                     'address'        => $validated['address'],
-                    'kyc_level'      => 'full',
-                    'kyc_status'     => 'approved',
-                    'status'         => 'active',
                 ]);
 
-                // Génération d'un numéro de portefeuille unique
-                do {
-                    $walletNumber = 'WLT-CLN-' . strtoupper(Str::random(10));
-                } while (Wallet::where('wallet_number', $walletNumber)->exists());
+                // Récupération du portefeuille principal pour la réponse de confirmation
+                $wallet = $customer->wallets()->where('type', 'main')->first();
 
-                $initialBalance = (float) ($validated['initial_balance'] ?? 0);
-
-                // 3. Création du portefeuille
-                $wallet = Wallet::create([
-                    'uuid'          => (string) Str::uuid(),
-                    'owner_id'      => $customer->id,
-                    'owner_type'    => Customer::class,
-                    'wallet_number' => $walletNumber,
-                    'type'          => 'main',
-                    'currency'      => 'XAF', // Idéalement dynamique selon le pays/country_id
-                    'balance'       => $initialBalance,
-                    'is_active'     => true,
-                ]);
-
-                // 4. Traçabilité financière (Dépôt initial)
-                if ($initialBalance > 0) {
-                    // IMPORTANT : Logique d'écriture comptable (Débit/Crédit, CashOperation) à insérer ici
-                    // Ex: CashOperation::create([...]);
-                }
-
-                Log::info("KYC_ARCH: Client [{$customer->reference}] créé avec succès par l'agent [ID: Auth::id()].");
+                Log::info("KYC_ARCH: Profil du client [{$customer->reference}] mis à jour avec succès par l'agent [ID: " . Auth::id() . "].");
 
                 return response()->json([
                     'success' => true,
-                    'message' => 'Profil client créé et validé avec succès au guichet.',
+                    'message' => 'Profil client mis à jour avec succès.',
                     'data'    => [
                         'id'            => $customer->id,
                         'reference'     => $customer->reference,
                         'name'          => "{$customerUser->first_name} {$customerUser->last_name}",
                         'phone'         => $customerUser->phone_number,
-                        'wallet_number' => $wallet->wallet_number,
-                        'balance'       => (float) $wallet->balance
+                        'wallet_number' => $wallet ? $wallet->wallet_number : 'N/A',
+                        'balance'       => $wallet ? (float) $wallet->balance : 0.0
                     ]
-                ], 201);
+                ], 200);
             });
 
         } catch (\Exception $e) {
-            Log::error("Erreur immatriculation guichet : " . $e->getMessage(), [
-                'exception' => $e,
-                'agent_id'  => Auth::id()
+            Log::error("Erreur modification profil guichet : " . $e->getMessage(), [
+                'exception'   => $e,
+                'customer_id' => $customer->id,
+                'agent_id'    => Auth::id()
             ]);
 
             return response()->json([
                 'success' => false,
-                'message' => 'Erreur lors du traitement de l\'immatriculation. Veuillez réessayer.'
-            ], 500); // 500 est plus approprié pour une erreur serveur / exception inattendue
+                'message' => 'Erreur lors du traitement des modifications. Veuillez réessayer.'
+            ], 500);
         }
     }
 
@@ -684,7 +880,7 @@ class CustomerController extends Controller
     /**
      * Mettre à jour le profil du client connecté.
      */
-    public function update(Request $request): JsonResponse
+    public function update2(Request $request): JsonResponse
     {
         $user = Auth::user();
         $customer = $user->customer;

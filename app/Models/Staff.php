@@ -107,4 +107,25 @@ class Staff extends Model
     {
         return $this->morphMany(Wallet::class, 'owner');
     }
+
+
+    /**
+     * Récupère le guichet (Till) actuellement OUVERT par cet agent.
+     */
+    public function currentTill()
+    {
+        // On récupère le guichet à travers la dernière opération d'ouverture active
+        return $this->hasOneThrough(
+            Till::class,
+            CashOperation::class,
+            'staff_id', // Clé étrangère sur CashOperation
+            'id',       // Clé primaire sur Till
+            'user_id',  // Clé primaire sur Staff (ou 'id' selon votre structure)
+            'till_id'   // Clé étrangère sur CashOperation pour rejoindre Till
+        )
+            ->where('cash_operations.type', 'opening')
+            ->where('tills.status', 'open')
+            ->where('tills.is_active', true)
+            ->latest('cash_operations.created_at'); // Prend la session d'ouverture la plus récente
+    }
 }

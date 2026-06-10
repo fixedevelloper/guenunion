@@ -271,11 +271,20 @@ class ReportingController extends Controller
         })
         ->sum('balance');
 
-    $totalPhysicalCash = Till::where('is_active', true)
-        ->whereHas('agency', function ($query) use ($country) {
-            $query->where('country_id', $country->id);
-        })
-        ->sum('current_balance');
+$totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Till::class si le wallet appartient au guichet
+->where('type', 'main')
+    ->where('is_active', true)
+    ->whereIn('owner_id', function ($query) use ($country) {
+        $query->select('id')
+            ->from('tills')
+            ->where('is_active', true)
+            ->whereIn('agency_id', function ($subQuery) use ($country) {
+                $subQuery->select('id')
+                    ->from('agencies')
+                    ->where('country_id', $country->id);
+            });
+    })
+    ->sum('balance');
 
     // 4. ✅ CHARGEMENT EN MASSE OPTIMISÉ ET SÉCURISÉ (Clés explicites)
     $agencies = Agency::where('country_id', $country->id)

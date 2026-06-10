@@ -4,7 +4,9 @@ namespace Database\Seeders;
 
 use App\Models\Country;
 use App\Models\City;
+use App\Models\Wallet;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Str;
 
 class CountryAndCitySeeder extends Seeder
 {
@@ -93,6 +95,21 @@ class CountryAndCitySeeder extends Seeder
                     ]
                 );
             }
+            Wallet::firstOrCreate(
+                [
+                    'owner_id'   => $country->id,
+                    'owner_type' => Country::class, // Morphisme vers l'agence
+                    'type'       => 'main',        // Type principal pour les opérations de caisse
+                ],
+                [
+                    'uuid'          => (string) Str::uuid(),
+                    'wallet_number' => 'WLT-CTR-' . $country->code . '-01', // Numéro de portefeuille unique et traçable
+                    'currency'      => $country->currency_code,
+                    'balance'       => 0.00,
+                    'is_active'     => true,
+                    'ledger_hash'   => null, // Sera calculé lors de la première transaction
+                ]
+            );
         }
 
         $this->command->info('-------------------------------------------------------');
