@@ -232,7 +232,12 @@ return new class extends Migration
                 'peer_to_peer',
                 'commission',
                 'adjustment',
-                'refund','vault_to_till','till_to_vault','country_to_agency','agency_to_country'
+                'refund',
+                'vault_to_till',
+                'till_to_vault',
+                'country_to_agency',
+                'agency_to_country',
+                'system_adjustment'
             ]);
             $table->enum('status', ['initiated', 'processing', 'completed', 'paid', 'failed', 'reversed', 'cancelled'])->default('initiated');
             $table->decimal('amount', 18, 2);
