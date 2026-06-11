@@ -286,9 +286,8 @@ class TransactionController extends Controller
                 $cleanRecipientPhone, $amount, $fees, $taxes, $totalDebit, $feesDetail, $type
             ) {
                 // Verrouillage pessimiste (Pessimistic Locking) pour éviter les Race Conditions de solde
-                $customerWallet = Wallet::where('id', $existingCustomer->id)
-                    ->lockForUpdate()
-                    ->first();
+
+                $customerWallet = Wallet::where('owner_id',  $existingCustomer->id)->where('owner_type', Customer::class)->where('type', 'main')->lockForUpdate()->firstOrFail();
 
                 if (!$customerWallet || (float) $customerWallet->balance < $totalDebit) {
                     throw new Exception("Le solde du portefeuille est insuffisant (Portefeuille manquant ou {$totalDebit} {$existingCustomer->country->currency} requis).");
