@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\Storage;
 class ChatController extends Controller
 {
     /**
-     * 1. Ouvrir ou créer un chat entre deux Clients (Peer to Peer)
+     * 1. Ouvrir ou récupérer un chat P2P entre deux clients
      */
     public function startPeerChat(Request $request): JsonResponse
     {
@@ -25,11 +25,11 @@ class ChatController extends Controller
             'recipient_id' => 'required|integer|exists:users,id'
         ]);
 
-        $authId = auth()->id();
-        $recipientId = $request->recipient_id;
+        $authId = Auth::id();
+        $recipientId = (int) $request->recipient_id;
 
-        // Éviter de créer un chat avec soi-même
-        if ($authId === (int)$recipientId) {
+        // Sécurité : Éviter de créer un chat avec soi-même
+        if ($authId === $recipientId) {
             return response()->json([
                 'success' => false,
                 'message' => 'Opération invalide : impossible de démarrer une discussion avec soi-même.'
@@ -41,30 +41,41 @@ class ChatController extends Controller
             ->whereHas('users', function($q) use ($authId) { $q->where('users.id', $authId); })
             ->whereHas('users', function($q) use ($recipientId) { $q->where('users.id', $recipientId); })
             ->with(['users', 'messages' => function($q) {
-                $q->latest()->limit(50); // Charge les 50 derniers messages pour l'UI mobile
+                $q->latest()->limit(50); // Pré-chargement des 50 derniers messages pour le mobile
             }])
             ->first();
 
+        // Si elle n'existe pas, création atomique sécurisée
         if (!$conversation) {
-            $conversation = Conversation::create(['type' => 'peer_to_peer']);
-            $conversation->users()->attach([$authId, $recipientId]);
-            $conversation->load('users');
+            $conversation = DB::transaction(function () use ($authId, $recipientId) {
+                $newConversation = Conversation::create([
+                    'type'   => 'peer_to_peer',
+                    'status' => 'open'
+                ]);
+
+                $newConversation->users()->attach([$authId, $recipientId]);
+                return $newConversation;
+            });
+
+            // Recharger les relations pour la ressource
+            $conversation->load(['users', 'messages']);
         }
 
         return response()->json([
             'success' => true,
-            'data' => $conversation
-        ]);
+            'message' => 'Conversation initialisée avec succès.',
+            'data'    => new ConversationResource($conversation)
+        ], 200);
     }
 
     /**
-     * 2. Ouvrir ou créer le ticket de chat avec le Support client
+     * 2. Ouvrir ou créer le ticket de chat actif avec le Support client
      */
     public function startSupportChat(): JsonResponse
     {
-        $authId = auth()->id();
+        $authId = Auth::id();
 
-        // Récupérer le ticket de support ouvert pour ce client
+        // Récupérer la conversation de support ouverte existante pour ce client
         $conversation = Conversation::where('type', 'support')
             ->where('status', 'open')
             ->whereHas('users', function($q) use ($authId) { $q->where('users.id', $authId); })
@@ -73,53 +84,74 @@ class ChatController extends Controller
             }])
             ->first();
 
+        // Si aucun ticket de support n'est ouvert, on en génère un nouveau
         if (!$conversation) {
-            $conversation = Conversation::create([
-                'type' => 'support',
-                'status' => 'open'
-            ]);
+            $conversation = DB::transaction(function () use ($authId) {
+                $newConversation = Conversation::create([
+                    'type'   => 'support',
+                    'status' => 'open'
+                ]);
 
-            $conversation->users()->attach($authId);
-            $conversation->load('users');
+                $newConversation->users()->attach($authId);
+                return $newConversation;
+            });
+
+            $conversation->load(['users', 'messages']);
         }
 
         return response()->json([
             'success' => true,
-            'data' => $conversation
-        ]);
+            'message' => 'Chat support initialisé.',
+            'data'    => new ConversationResource($conversation)
+        ], 200);
     }
 
     /**
-     * 3. Envoyer un message (Texte et/ou Image média)
+     * 3. Envoyer un message (Texte, Document ou Image média)
      */
-
-    public function sendMessage(Request $request, $conversationId)
+    public function sendMessage(Request $request, $conversationId): JsonResponse
     {
-        $authId = Auth::id();
 
-        // 1. Validation de la requête
+        // Validation stricte des flux médias de l'application
         $request->validate([
-            'body' => 'nullable|string',
+            'body' => 'required_if:type,text|nullable|string',
             'type' => 'required|string|in:text,image,document',
-            'file' => 'nullable|image|max:5120', // Max 5MB pour les images sur Guen's
+            'file' => 'required_if:type,image,document|nullable|file|max:5120', // Max 5MB
         ]);
 
-        // 2. Sécurité : Vérifier que l'expéditeur appartient bien à cette conversation
-        $conversation = Conversation::where('id', $conversationId)
-            ->whereHas('users', function ($q) use ($authId) {
-                $q->where('users.id', $authId);
-            })->firstOrFail();
+        // 1. Vérifier si la conversation existe TOUT COURT
+        $baseConversation = Conversation::find($conversationId);
+
+        if (!$baseConversation) {
+            return response()->json([
+                'success' => false,
+                'message' => "La conversation avec l'ID {$conversationId} n'existe pas du tout dans la base de données."
+            ], 404);
+        }
+
+// 2. Vérifier si l'utilisateur y est rattaché
+        $authId = Auth::id();
+        $userIsParticipant = $baseConversation->users()->where('users.id', $authId)->exists();
+
+        if (!$userIsParticipant) {
+            return response()->json([
+                'success' => false,
+                'message' => "Sécurité : L'utilisateur connecté (ID: {$authId}) ne fait pas partie des participants de cette conversation."
+            ], 403); // 403 Forbidden au lieu d'un faux 404
+        }
+
+// Si tout est OK, on récupère le modèle complet
+        $conversation = $baseConversation;
 
         $filePath = null;
 
-        // 3. Gestion du téléversement de l'image (Multipart)
+        // Gestion du téléversement de fichier multi-format (Images ou Documents d'affaires)
         if ($request->hasFile('file') && $request->file('file')->isValid()) {
-            // Stockage dans storage/app/public/chats
             $path = $request->file('file')->store('chats', 'public');
-            $filePath = Storage::url($path); // Génère l'URL publique (/storage/chats/xyz.jpg)
+            $filePath = Storage::url($path); // Exemple de rendu : /storage/chats/xyz.jpg
         }
 
-        // 4. Sauvegarde en Base de Données
+        // Sauvegarde de l'entrée de message
         $message = Message::create([
             'conversation_id' => $conversation->id,
             'user_id'         => $authId,
@@ -128,64 +160,26 @@ class ChatController extends Controller
             'file_path'       => $filePath,
         ]);
 
-        // 5. ⚡ Dispatch de l'événement Reverb pour le Temps Réel
+        // ⚡ WebSocket : Dispatch sur Reverb pour la mise à jour en temps réel des interfaces
         broadcast(new MessageSent($message))->toOthers();
 
-        // 6. Retourne le message formaté pour mettre à jour l'ID côté Android
         return response()->json([
             'success' => true,
-            'message' => 'Message envoyé.',
+            'message' => 'Message envoyé avec succès.',
             'data'    => new MessageResource($message)
         ], 201);
     }
-    public function createOrGetConversation($contactId)
+
+    /**
+     * 4. Récupérer l'historique complet des messages d'une discussion
+     * @param $conversationId
+     * @return JsonResponse
+     */
+    public function getMessages($conversationId): JsonResponse
     {
         $authId = Auth::id();
 
-        if ($authId == $contactId) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Vous ne pouvez pas ouvrir une discussion avec vous-même.'
-            ], 400);
-        }
-
-        // 🔍 Chercher s'il existe une conversation de type 'peer_to_peer' contenant EXACTEMENT ces deux utilisateurs
-        $conversation = Conversation::where('type', 'peer_to_peer')
-            ->whereHas('users', function ($query) use ($authId) {
-                $query->where('users.id', $authId);
-            })
-            ->whereHas('users', function ($query) use ($contactId) {
-                $query->where('users.id', $contactId);
-            })
-            ->first();
-
-        // ⚡ Si elle n'existe pas, on la crée de manière atomique (Transaction)
-        if (!$conversation) {
-            $conversation = DB::transaction(function () use ($authId, $contactId) {
-                $newConversation = Conversation::create([
-                    'type' => 'peer_to_peer',
-                    'status' => 'open'
-                ]);
-
-                // Attacher les deux utilisateurs dans la table pivot 'conversation_user'
-                $newConversation->users()->attach([$authId, $contactId]);
-
-                return $newConversation;
-            });
-        }
-
-        return response()->json([
-            'success' => true,
-            'message' => 'Conversation initialisée avec succès.',
-            'data' => new ConversationResource($conversation)
-        ], 200);
-    }
-
-    public function getMessages($conversationId)
-    {
-        $authId = Auth::id();
-
-        // 🔍 Récupérer la conversation en vérifiant que l'utilisateur connecté fait partie des membres (sécurité)
+        // Récupérer la conversation en vérifiant les accès du demandeur
         $conversation = Conversation::where('id', $conversationId)
             ->whereHas('users', function ($query) use ($authId) {
                 $query->where('users.id', $authId);
@@ -199,14 +193,15 @@ class ChatController extends Controller
             ], 404);
         }
 
-        // 📜 Récupérer les messages associés
+        // Récupération indexée par ordre chronologique ascendant (idéal pour le flux d'un chat)
         $messages = $conversation->messages()
-            ->orderBy('created_at', 'asc') // Ordre chronologique pour le flux du chat mobile
+            ->with('user')
+            ->orderBy('created_at', 'asc')
             ->get();
 
         return response()->json([
             'success' => true,
-            'data' => MessageResource::collection($messages)
+            'data'    => MessageResource::collection($messages)
         ], 200);
     }
 }

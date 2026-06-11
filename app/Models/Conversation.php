@@ -21,4 +21,9 @@ class Conversation extends Model
     {
         return $this->hasMany(Message::class);
     }
+    // L'agence associée (si applicable)
+    public function agency(): BelongsTo
+    {
+        return $this->belongsTo(Agency::class);
+    }
 }

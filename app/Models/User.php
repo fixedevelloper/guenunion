@@ -107,4 +107,9 @@ class User extends Authenticatable
     {
         return $this->hasRole('country_admin');
     }
+    // Les conversations auxquelles participe l'utilisateur
+    public function conversations(): BelongsToMany
+    {
+        return $this->belongsToMany(Conversation::class)->withTimestamps();
+    }
 }

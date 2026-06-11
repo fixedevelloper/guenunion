@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Agency;
+use App\Models\Country;
 use App\Models\Transaction;
 use App\Models\Wallet;
 use App\Models\TransactionEntry;
@@ -266,15 +267,16 @@ class AgencyController extends Controller
 
     public function adjustVault(Request $request, string $uuid): JsonResponse
     {
-        Log::warning("Initialisation à l'ajustement de coffre", [
+        Log::warning("Initialisation à l'ajustement de coffre national vers agence", [
             'user_id' => Auth::id(),
             'user_email' => Auth::user()->email ?? 'Inconnu',
             'agency_uuid' => $uuid,
             'ip' => request()->ip()
         ]);
-        // Alignement des rôles Spatie
+
+        // 1. Alignement des rôles Spatie (Seule la hiérarchie nationale ou supérieure peut mouvementer le compte Pays)
         if (!Auth::user()->hasAnyRole(['super_admin', 'country_admin'])) {
-            Log::warning("Tentative d'accès non autorisée à l'ajustement de coffre", [
+            Log::warning("Tentative d'accès non autorisée à l'ajustement de coffre national", [
                 'user_id' => Auth::id(),
                 'user_email' => Auth::user()->email ?? 'Inconnu',
                 'agency_uuid' => $uuid,
@@ -288,22 +290,13 @@ class AgencyController extends Controller
         }
 
         $request->validate([
-            'action'      => 'required|string|in:fund,debit',
+            'action'      => 'required|string|in:fund,debit', // fund = Approvisionner l'agence depuis le pays, debit = Rapatrier de l'agence vers le pays
             'amount'      => 'required|numeric|min:5000',
             'description' => 'required|string|max:255|min:5',
             'is_physical' => 'nullable|boolean'
         ]);
 
         $operator = Auth::user();
-
-        // Log de début de procédure informatique
-        Log::info("Début de la procédure d'ajustement de coffre", [
-            'operator_id' => $operator->id,
-            'agency_uuid' => $uuid,
-            'action'      => $request->input('action'),
-            'amount'      => $request->input('amount'),
-            'is_physical' => $request->input('is_physical', false)
-        ]);
 
         try {
             $agency = Agency::where('uuid', $uuid)->firstOrFail();
@@ -313,7 +306,7 @@ class AgencyController extends Controller
 
             $transaction = DB::transaction(function () use ($operator, $agency, $amount, $action, $isPhysical, $request) {
 
-                // 1. Verrouillage du portefeuille virtuel principal de l'agence (Cible)
+                // 1. Verrouillage du portefeuille virtuel principal de l'agence (Cible/Émetteur local)
                 $agencyWallet = Wallet::where('owner_type', Agency::class)
                     ->where('owner_id', $agency->id)
                     ->where('type', 'main')
@@ -321,24 +314,27 @@ class AgencyController extends Controller
                     ->first();
 
                 if (!$agencyWallet || !$agencyWallet->is_active) {
-                    Log::error("Échec ajustement : Portefeuille agence introuvable ou inactif", ['agency_id' => $agency->id]);
                     throw new Exception("Coffre virtuel d'agence introuvable, suspendu ou non initialisé.");
                 }
 
-                // 2. Verrouillage du portefeuille de contrepartie du Système
-                $systemMasterWallet = Wallet::where('type', 'escrow')
-                    ->where('currency', $agencyWallet->currency)
-                    ->where('is_active', true)
+                // 2. Verrouillage du portefeuille Trésorerie Nationale du Pays rattaché à l'agence
+                $countryWallet = Wallet::where('owner_type', Country::class)
+                    ->where('owner_id', $agency->country_id)
+                    ->where('type', 'main')
                     ->lockForUpdate()
                     ->first();
 
-                if (!$systemMasterWallet) {
-                    Log::error("Échec ajustement : Trésorerie centrale introuvable", ['currency' => $agencyWallet->currency]);
-                    throw new Exception("Compte de trésorerie centrale indisponible pour cette devise.");
+                if (!$countryWallet || !$countryWallet->is_active) {
+                    throw new Exception("Compte de trésorerie nationale (Pays) indisponible ou suspendu pour cette agence.");
                 }
 
-                // 3. CRÉATION DE LA TRANSACTION PARENTE (Audit principal)
-                $reference = 'ADJ-' . now()->format('Ymd') . '-' . strtoupper(Str::random(6));
+                // Sécurité additionnelle : Alignement des devises obligatoires
+                if ($agencyWallet->currency !== $countryWallet->currency) {
+                    throw new Exception("Incohérence monétaire : La devise de l'agence ne correspond pas à celle du compte national.");
+                }
+
+                // 3. INITIALISATION DE LA TRANSACTION COMPTABLE PARENTE
+                $reference = 'ADJ-NAT-' . now()->format('Ymd') . '-' . strtoupper(Str::random(6));
 
                 $transaction = Transaction::create([
                     'uuid'                  => (string) Str::uuid(),
@@ -356,50 +352,51 @@ class AgencyController extends Controller
                     'metadata'              => [
                         'is_physical' => $isPhysical,
                         'action_type' => $action,
-                        'triggered_by' => $operator->name
+                        'country_id'  => $agency->country_id,
+                        'triggered_by'=> $operator->first_name . ' ' . $operator->last_name
                     ]
                 ]);
 
+                // Captures des états avant écritures
                 $agencyBalanceBefore = (float) $agencyWallet->balance;
-                $systemBalanceBefore = (float) $systemMasterWallet->balance;
+                $countryBalanceBefore = (float) $countryWallet->balance;
 
                 if ($action === 'fund') {
-                    if ($systemBalanceBefore < $amount) {
-                        Log::warning("Échec ajustement : Solde système insuffisant pour fund", [
-                            'reference' => $reference,
-                            'system_balance' => $systemBalanceBefore,
-                            'requested_amount' => $amount
-                        ]);
-                        throw new Exception("Trésorerie centrale insuffisante pour allouer cette ligne de provision.");
+                    // Approvisionnement : Compte National (Pays) -> Compte Agence
+                    if ($countryBalanceBefore < $amount) {
+                        throw new Exception("Trésorerie nationale insuffisante pour allouer cette provision à l'agence.");
                     }
+
+                    // Calculs exacts en mémoire locale (Sécurité double écriture renforcée)
+                    $agencyBalanceAfter  = $agencyBalanceBefore + $amount;
+                    $countryBalanceAfter = $countryBalanceBefore - $amount;
 
                     $agencyWallet->increment('balance', $amount);
-                    $systemMasterWallet->decrement('balance', $amount);
+                    $countryWallet->decrement('balance', $amount);
 
-                    $agencyEntryType = 'credit';
-                    $systemEntryType = 'debit';
+                    $agencyEntryType  = 'credit';
+                    $countryEntryType = 'debit';
                 } else {
+                    // Rapatriement : Compte Agence -> Compte National (Pays)
                     if ($agencyBalanceBefore < $amount) {
-                        Log::warning("Échec ajustement : Solde agence insuffisant pour debit", [
-                            'reference' => $reference,
-                            'agency_balance' => $agencyBalanceBefore,
-                            'requested_amount' => $amount
-                        ]);
-                        throw new Exception("Solde de coffre virtuel insuffisant pour effectuer ce retrait.");
+                        throw new Exception("Solde du coffre virtuel de l'agence insuffisant pour effectuer ce rapatriement.");
                     }
 
-                    $agencyWallet->decrement('balance', $amount);
-                    $systemMasterWallet->increment('balance', $amount);
+                    $agencyBalanceAfter  = $agencyBalanceBefore - $amount;
+                    $countryBalanceAfter = $countryBalanceBefore + $amount;
 
-                    $agencyEntryType = 'debit';
-                    $systemEntryType = 'credit';
+                    $agencyWallet->decrement('balance', $amount);
+                    $countryWallet->increment('balance', $amount);
+
+                    $agencyEntryType  = 'debit';
+                    $countryEntryType = 'credit';
                 }
 
-                // 4. DOUBLE ÉCRITURE DANS LE GRAND LIVRE
+                // 4. DOUBLE ÉCRITURE CRYPTOGRAPHIQUE (Utilisation des variables locales fiables)
 
-                // Écriture Agence (Cible)
+                // Écriture du Grand Livre côté Agence
                 $agencySignature = $this->ledgerService->generateSignature(
-                    $agencyWallet->id, $amount, $agencyEntryType, $agencyBalanceBefore, (float) $agencyWallet->fresh()->balance
+                    $agencyWallet->id, $amount, $agencyEntryType, $agencyBalanceBefore, $agencyBalanceAfter
                 );
                 TransactionEntry::create([
                     'uuid'           => (string) Str::uuid(),
@@ -408,69 +405,57 @@ class AgencyController extends Controller
                     'entry_type'     => $agencyEntryType,
                     'amount'         => $amount,
                     'balance_before' => $agencyBalanceBefore,
-                    'balance_after'  => $agencyWallet->fresh()->balance,
+                    'balance_after'  => $agencyBalanceAfter,
                     'row_signature'  => $agencySignature
                 ]);
 
-                // Écriture Système (Contrepartie comptable)
-                $systemSignature = $this->ledgerService->generateSignature(
-                    $systemMasterWallet->id, $amount, $systemEntryType, $systemBalanceBefore, (float) $systemMasterWallet->fresh()->balance
+                // Écriture du Grand Livre côté Compte National (Pays)
+                $countrySignature = $this->ledgerService->generateSignature(
+                    $countryWallet->id, $amount, $countryEntryType, $countryBalanceBefore, $countryBalanceAfter
                 );
                 TransactionEntry::create([
                     'uuid'           => (string) Str::uuid(),
                     'transaction_id' => $transaction->id,
-                    'wallet_id'      => $systemMasterWallet->id,
-                    'entry_type'     => $systemEntryType,
+                    'wallet_id'      => $countryWallet->id,
+                    'entry_type'     => $countryEntryType,
                     'amount'         => $amount,
-                    'balance_before' => $systemBalanceBefore,
-                    'balance_after'  => $systemMasterWallet->fresh()->balance,
-                    'row_signature'  => $systemSignature
+                    'balance_before' => $countryBalanceBefore,
+                    'balance_after'  => $countryBalanceAfter,
+                    'row_signature'  => $countrySignature
                 ]);
 
-                // 5. MISE À JOUR DE L'ENCAISSE PHYSIQUE (Optionnelle)
+                // 5. SYNCHRONISATION DE L'ENCAISSE PHYSIQUE COFFRE-FORT DE L'AGENCE
                 if ($isPhysical) {
                     if ($action === 'fund') {
                         $agency->increment('current_balance', $amount);
                     } else {
                         if ((float) $agency->current_balance < $amount) {
-                            Log::warning("Échec ajustement : Encaisse physique insuffisante pour l'agence", [
-                                'reference' => $reference,
-                                'physical_balance' => $agency->current_balance,
-                                'requested_amount' => $amount
-                            ]);
-                            throw new Exception("L'encaisse physique en espèces de l'agence est inférieure au montant du décaissement demandé.");
+                            throw new Exception("L'encaisse physique en coffre fort de l'agence est inférieure au montant du rapatriement demandé.");
                         }
                         $agency->decrement('current_balance', $amount);
                     }
-
-                    Log::info("Encaisse physique mise à jour pour l'agence", [
-                        'reference' => $reference,
-                        'agency_id' => $agency->id,
-                        'new_physical_balance' => $agency->fresh()->current_balance
-                    ]);
                 }
 
-                // 6. CLÔTURE DE LA TRANSACTION PARENTE
+                // 6. SCELLER LA TRANSACTION PARENTE
                 $transaction->update([
                     'status'       => 'completed',
                     'completed_at' => now()
                 ]);
 
-                // 7. JOURNALISATION D'AUDIT SÉCURITÉ (Base de données)
+                // 7. AUDIT DE TRAÇABILITÉ DES OPÉRATIONS NATIONALES
                 SystemAuditLog::create([
                     'uuid'       => (string) Str::uuid(),
                     'user_id'    => $operator->id,
                     'agency_id'  => $agency->id,
-                    'event_type' => 'VAULT.ADJUSTMENT',
-                    'severity'   => $action === 'fund' ? 'info' : 'warning',
-                    'message'    => "Ajustement de coffre effectué via transaction #{$reference}.",
+                    'event_type' => 'VAULT.NATIONAL_ADJUSTMENT',
+                    'severity'   => 'info',
+                    'message'    => "Ajustement Trésorerie Nationale ({$agencyWallet->currency}) vers Agence [{$agency->name}] validé via #{$reference}.",
                     'payload'    => [
                         'transaction_uuid' => $transaction->uuid,
                         'reference'        => $reference,
                         'action_type'      => $action,
                         'is_physical'      => $isPhysical,
                         'amount'           => $amount,
-                        'description'      => $request->input('description')
                     ],
                     'ip_address' => request()->ip(),
                     'user_agent' => request()->userAgent(),
@@ -479,18 +464,9 @@ class AgencyController extends Controller
                 return $transaction;
             });
 
-            // Log d'application de succès final (Fichiers logs de Laravel)
-            Log::info("Ajustement de coffre validé avec succès", [
-                'reference'   => $transaction->reference,
-                'operator_id' => $operator->id,
-                'agency_id'   => $agency->id,
-                'action'      => $action,
-                'amount'      => $amount
-            ]);
-
             return response()->json([
                 'success' => true,
-                'message' => "Ajustement de coffre traité, signé et enregistré sous la référence {$transaction->reference}.",
+                'message' => "L'ajustement Trésorerie Nationale vers Agence a été traité et signé avec succès sous la référence {$transaction->reference}.",
                 'data'    => [
                     'reference' => $transaction->reference,
                     'status'    => $transaction->status
@@ -498,12 +474,10 @@ class AgencyController extends Controller
             ], 200);
 
         } catch (Exception $e) {
-            // Log d'erreur critique avec contexte complet et trace
-            Log::error("Échec critique de l'ajustement de coffre", [
+            Log::error("Échec critique de l'ajustement Trésorerie Nationale vers Agence", [
                 'message'     => $e->getMessage(),
                 'operator_id' => $operator->id ?? null,
                 'agency_uuid' => $uuid,
-                'payload'     => $request->only(['action', 'amount', 'is_physical']),
                 'trace'       => $e->getTraceAsString()
             ]);
 

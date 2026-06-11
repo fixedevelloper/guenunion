@@ -13,7 +13,7 @@ class MessageResource extends JsonResource
     {
         return [
             'id' => $this->id,
-            'text' => $this->body,
+            'body' => $this->body,
             'type' => $this->type, // text, image
             'file_path' => $this->file_path,
             'is_from_me' => $this->user_id === Auth::id(), // 🔑 Détermine l'alignement dans Compose

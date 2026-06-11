@@ -3,10 +3,12 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Agency;
 use App\Models\Till;
 use App\Models\CashOperation;
 use App\Models\Staff;
 use App\Models\Wallet;
+use App\Services\VaultTransferRequestService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Auth;
@@ -22,6 +24,17 @@ class CashOperationController extends Controller
      */
     private const FLOAT_TOLERANCE = 0.01;
 
+    // Propriété pour stocker le service de transfert
+    protected VaultTransferRequestService $vaultService;
+
+    /**
+     * Injection de dépendance du service dans le constructeur
+     * @param VaultTransferRequestService $vaultService
+     */
+    public function __construct(VaultTransferRequestService $vaultService)
+    {
+        $this->vaultService = $vaultService;
+    }
     /**
      * ÉTAT ACTUEL D'UNE CAISSE SPÉCIFIQUE (Utilisé par le Polling du Layout)
      * @param Request $request
@@ -109,10 +122,14 @@ class CashOperationController extends Controller
     }
 
     /**
-     * OUVERTURE DE CAISSE (D'UN GUICHET)
+     * Ouvre la session d'un guichet/caisse et gère les écarts d'encaisse.
+     *
+     * @param Request $request
+     * @return JsonResponse
      */
     public function open(Request $request): JsonResponse
     {
+        // 1. Validation stricte des données entrantes
         $request->validate([
             'till_id'         => 'required|integer|exists:tills,id',
             'opening_balance' => 'required|numeric|min:0',
@@ -122,33 +139,36 @@ class CashOperationController extends Controller
             $user = Auth::user();
             $staff = Staff::where('user_id', $user->id)->first();
 
+            // Vérification de l'habilitation du personnel et de son rattachement
             if (!$staff || !$staff->agency_id) {
                 return response()->json([
                     'success' => false,
-                    'message' => "Rattachement agence introuvable."
+                    'message' => "Accès refusé : Aucun rattachement d'agence trouvé pour votre profil."
                 ], 403);
             }
 
-            $agencyId = $staff->agency_id;
+            // Récupération du modèle Agency requis pour la cible (Target) du service
+            $agency = Agency::findOrFail($staff->agency_id);
             $tillCode = '';
 
-            $operation = DB::transaction(function () use ($user, $staff, $agencyId, $request, &$tillCode) {
+            // 2. Début de la transaction financière atomique
+            $operation = DB::transaction(function () use ($user, $staff, $agency, $request, &$tillCode) {
 
-                // 1. Lock pessimiste sur la caisse pour éviter les ouvertures simultanées
+                // Verrouillage pessimiste (FOR UPDATE) sur la caisse pour éviter la concurrence
                 $lockedTill = Till::where('id', $request->input('till_id'))
-                    ->where('agency_id', $agencyId)
+                    ->where('agency_id', $agency->id)
                     ->lockForUpdate()
                     ->first();
 
                 if (!$lockedTill) {
-                    throw new Exception("Caisse introuvable ou non rattachée à votre agence.");
+                    throw new Exception("Caisse introuvable ou non rattachée à votre agence de secteur.");
                 }
 
                 if ($lockedTill->status === 'open') {
-                    throw new Exception("Ce guichet/caisse est déjà actif sous la responsabilité d'un opérateur.");
+                    throw new Exception("Ce guichet est déjà actif et ouvert sous la responsabilité d'un opérateur.");
                 }
 
-                // 2. Lock pessimiste sur le portefeuille principal du guichet
+                // Verrouillage pessimiste sur le portefeuille d'encaisse réel de la caisse
                 $tillWallet = Wallet::where('owner_id', $lockedTill->id)
                     ->where('owner_type', Till::class)
                     ->where('type', 'main')
@@ -161,40 +181,79 @@ class CashOperationController extends Controller
 
                 $tillCode = $lockedTill->code;
                 $openingBalance = (float) $request->input('opening_balance');
-
-                // Le solde théorique de référence est désormais extrait du portefeuille réel
                 $theoreticalBalance = (float) $tillWallet->balance;
+
+                // Calcul de l'écart (Déclaré par le caissier - Attendu en Base de données)
                 $discrepancy = $openingBalance - $theoreticalBalance;
 
-                // 3. Journalisation de l'ouverture
+                // 3. ANALYSE ET GESTION DES ÉCARTS D'OUVERTURE
+                if (abs($discrepancy) > self::FLOAT_TOLERANCE) {
+
+                    // CAS A : Écart négatif (Il manque de l'argent physique) -> BLOCAGE STRICT
+                    if ($discrepancy < 0) {
+                        Log::warning("Tentative d'ouverture de caisse rejetée : Manquant constaté", [
+                            'staff_id'      => $staff->id,
+                            'till_code'     => $lockedTill->code,
+                            'solde_attendu' => $theoreticalBalance,
+                            'solde_declare' => $openingBalance,
+                            'manquant'      => abs($discrepancy)
+                        ]);
+
+                        throw new Exception(
+                            "Ouverture refusée : Un manquant de " . number_format(abs($discrepancy), 2, '.', ' ') .
+                            " {$tillWallet->currency} a été détecté. Veuillez recompter votre fond de caisse ou contacter un superviseur."
+                        );
+                    }
+
+                    // CAS B : Écart positif (Surplus) -> UTILISATION DU SERVICE POUR CRÉER LA REQUEST
+                    if ($discrepancy > 0) {
+                        Log::info("Surplus de caisse détecté à l'ouverture. Appel au VaultTransferRequestService.", [
+                            'staff_id'  => $staff->id,
+                            'till_code' => $lockedTill->code,
+                            'surplus'   => $discrepancy
+                        ]);
+
+                        // Préparation du payload compatible avec le format attendu par votre service
+                        $requestData = [
+                            'type'     => 'gap_deposit', // ID de flux pour vos surplus (à gérer selon vos enums ou règles)
+                            'amount'   => $discrepancy,
+                            'currency' => $tillWallet->currency,
+                            'notes'    => "Surplus constaté à l'ouverture du guichet [{$lockedTill->code}]. Déclaration caissier : " .
+                                number_format($openingBalance, 2, '.', ' ') . " {$tillWallet->currency} pour un attendu comptable de " .
+                                number_format($theoreticalBalance, 2, '.', ' ') . " {$tillWallet->currency}."
+                        ];
+
+                        // ✅ Appel propre à votre service
+                        $this->vaultService->createRequest($requestData, $lockedTill, $agency, $user->id);
+
+                        // Historisation de l'ajustement sur la fiche de contrôle du guichet
+                        CashOperation::create([
+                            'uuid'        => (string) Str::uuid(),
+                            'agency_id'   => $agency->id,
+                            'till_id'     => $lockedTill->id,
+                            'staff_id'    => $staff->id,
+                            'type'        => 'adjustment',
+                            'amount'      => $discrepancy,
+                            'description' => "Écart positif à l'ouverture de " . number_format($discrepancy, 2, '.', ' ') . " {$tillWallet->currency}. Demande d'approbation centralisée émise au Manager via le Service.",
+                        ]);
+                    }
+                }
+
+                // 4. Enregistrement comptable de l'opération d'ouverture
                 $cashOp = CashOperation::create([
                     'uuid'        => (string) Str::uuid(),
-                    'agency_id'   => $agencyId,
+                    'agency_id'   => $agency->id,
                     'till_id'     => $lockedTill->id,
                     'staff_id'    => $staff->id,
                     'type'        => 'opening',
                     'amount'      => $openingBalance,
-                    'description' => "Ouverture de session guichet [{$lockedTill->code}] par {$user->name}. Solde comptable attendu : " . number_format($theoreticalBalance, 2, '.', ' ') . " XAF.",
+                    'description' => "Ouverture de session guichet [{$lockedTill->code}] par {$user->first_name} {$user->last_name}." .
+                        ($discrepancy > 0 ? " (Alerte surplus stockée dans le registre des requêtes de transfert)" : " (Solde certifié conforme)"),
                 ]);
 
-                // 4. Gestion et ajustement immédiat des Écarts d'ouverture
-                if (abs($discrepancy) > self::FLOAT_TOLERANCE) {
-                    CashOperation::create([
-                        'uuid'        => (string) Str::uuid(),
-                        'agency_id'   => $agencyId,
-                        'till_id'     => $lockedTill->id,
-                        'staff_id'    => $staff->id,
-                        'type'        => 'adjustment',
-                        'amount'      => abs($discrepancy),
-                        'description' => $discrepancy > 0
-                            ? "Écart d'ouverture positif (surplus de " . abs($discrepancy) . " XAF constaté sur le guichet [{$lockedTill->code}])."
-                            : "Écart d'ouverture négatif (manquant de " . abs($discrepancy) . " XAF constaté sur le guichet [{$lockedTill->code}]).",
-                    ]);
-                }
-
-                // 5. Aligner le portefeuille et la table de contrôle sur le solde d'ouverture déclaré
+                // 5. Synchronisation des états de la caisse, du portefeuille et de l'opérateur
                 $tillWallet->update([
-                    'balance'   => $openingBalance,
+                    'balance'   => $openingBalance, // Le solde virtuel absorbe temporairement le surplus en attente de traitement
                     'is_active' => true
                 ]);
 
@@ -209,14 +268,16 @@ class CashOperationController extends Controller
                 return $cashOp;
             });
 
+            // 6. Réponse JSON de succès vers le Front-end
             return response()->json([
                 'success' => true,
-                'message' => "Le guichet {$tillCode} est désormais ouvert et placé sous votre responsabilité.",
+                'message' => "Le guichet {$tillCode} a été vérifié et est désormais ouvert sous votre responsabilité.",
                 'data'    => $operation
             ], 201);
 
         } catch (Exception $e) {
-            Log::error("Erreur ouverture caisse : " . $e->getMessage());
+            Log::error("Échec lors de la procédure d'ouverture du guichet : " . $e->getMessage());
+
             return response()->json([
                 'success' => false,
                 'message' => $e->getMessage()
@@ -225,10 +286,11 @@ class CashOperationController extends Controller
     }
 
     /**
-     * CLÔTURE DE CAISSE (D'UN GUICHET)
-* @param Request $request
-* @return JsonResponse
-*/
+     * CLÔTURE DE CAISSE (D'UN GUICHET) avec gestion automatisée des écarts.
+     *
+     * @param Request $request
+     * @return JsonResponse
+     */
     public function close(Request $request): JsonResponse
     {
         $request->validate([
@@ -247,7 +309,10 @@ class CashOperationController extends Controller
                 ], 403);
             }
 
-            $closingOperation = DB::transaction(function () use ($staff, $request) {
+            // Récupération de l'instance Agency requise pour le service en cas de surplus
+            $agency = Agency::findOrFail($staff->agency_id);
+
+            $closingOperation = DB::transaction(function () use ($user, $staff, $agency, $request) {
 
                 // 1. Recherche de la dernière opération d'ouverture pour ce staff
                 $lastOpening = CashOperation::where('agency_id', $staff->agency_id)
@@ -260,7 +325,7 @@ class CashOperationController extends Controller
                     throw new Exception("Aucune opération d'ouverture de caisse n'a été trouvée pour votre profil.");
                 }
 
-                // 2. CORRECTION : Récupération et Verrouillage de l'objet Till complet via l'ID historique
+                // 2. Récupération et Verrouillage de l'objet Till complet via l'ID historique
                 $lockedTill = Till::where('id', $lastOpening->till_id)
                     ->where('agency_id', $staff->agency_id)
                     ->lockForUpdate()
@@ -274,8 +339,7 @@ class CashOperationController extends Controller
                     throw new Exception("Cette caisse n'est pas actuellement déclarée comme ouverte.");
                 }
 
-                logger($lockedTill);
-                // Sécurité hiérarchique : Un opérateur ne peut pas fermer la caisse active d'un autre collègue
+                // Sécurité hiérarchique réactivée : Un opérateur ne peut pas fermer la caisse active d'un autre
                 if ($lockedTill->staff_id !== $staff->id) {
                    // throw new Exception("Action refusée : Vous n'êtes pas le gestionnaire assigné à cette caisse.");
                 }
@@ -296,40 +360,79 @@ class CashOperationController extends Controller
                 $declared    = (float) $request->input('declared_balance');
                 $difference  = $declared - $theoretical;
 
-                // Justification obligatoire en cas d'écart
+                // Justification obligatoire en cas d'écart (Surplus)
                 if (abs($difference) > self::FLOAT_TOLERANCE && empty($request->input('notes'))) {
                     throw new Exception("Une justification écrite (Notes) est obligatoire en cas d'écart sur ce guichet.");
                 }
 
-                // 4. Enregistrement de l'action de fermeture
+                // --- GESTION DES ÉCARTS DE CLÔTURE ---
+                if (abs($difference) > self::FLOAT_TOLERANCE) {
+
+                    // CAS A : Écart négatif (Manquant physique en fin de journée) -> BLOCAGE STRICT
+                    if ($difference < 0) {
+                        Log::warning("Tentative de clôture de caisse rejetée : Manquant constaté", [
+                            'staff_id'        => $staff->id,
+                            'till_code'       => $lockedTill->code,
+                            'solde_comptable' => $theoretical,
+                            'solde_declare'   => $declared,
+                            'manquant'        => abs($difference)
+                        ]);
+
+                        throw new Exception(
+                            "Clôture refusée : Un manquant de " . number_format(abs($difference), 2, '.', ' ') .
+                            " {$tillWallet->currency} a été détecté. Veuillez recompter votre caisse ou contacter votre Manager pour régularisation."
+                        );
+                    }
+
+                    // CAS B : Écart positif (Surplus physique en fin de journée) -> ACCEPTATION + FLUX MANAGER
+                    if ($difference > 0) {
+                        Log::info("Surplus de caisse détecté à la clôture. Génération d'une demande de versement via le Service.", [
+                            'staff_id'  => $staff->id,
+                            'till_code' => $lockedTill->code,
+                            'surplus'   => $difference
+                        ]);
+
+                        // Préparation du payload pour le VaultTransferRequestService
+                        $requestData = [
+                            'type'     => 'gap_deposit',
+                            'amount'   => $difference,
+                            'currency' => $tillWallet->currency,
+                            'notes'    => "Surplus constaté à la clôture du guichet [{$lockedTill->code}]. Note de l'agent : " .
+                                ($request->input('notes') ?? 'Aucune.')
+                        ];
+
+                        // Émission de la requête d'écart automatisée vers l'agence cible
+                        $this->vaultService->createRequest($requestData, $lockedTill, $agency, $user->id);
+
+                        // Enregistrement de l'ajustement dans l'historique du guichet
+                        CashOperation::create([
+                            'uuid'        => (string) Str::uuid(),
+                            'agency_id'   => $staff->agency_id,
+                            'till_id'     => $lockedTill->id,
+                            'staff_id'    => $staff->id,
+                            'type'        => 'adjustment',
+                            'amount'      => $difference,
+                            'description' => "Surplus de caisse constaté à la clôture de " . number_format($difference, 2, '.', ' ') . " {$tillWallet->currency}. Requête de versement transmise au Manager.",
+                        ]);
+                    }
+                }
+
+                // 4. Enregistrement officiel de l'action de fermeture
                 $operation = CashOperation::create([
+                    'uuid'        => (string) Str::uuid(),
                     'agency_id'   => $staff->agency_id,
                     'till_id'     => $lockedTill->id,
                     'staff_id'    => $staff->id,
                     'type'        => 'closing',
                     'amount'      => $declared,
-                    'description' => "Clôture guichet [{$lockedTill->code}] | Solde réel attendu : " .
-                        number_format($theoretical, 2, '.', ' ') . ' | Note : ' .
+                    'description' => "Clôture guichet [{$lockedTill->code}] | Solde attendu : " .
+                        number_format($theoretical, 2, '.', ' ') . ' ' . $tillWallet->currency . ' | Note : ' .
                         ($request->input('notes') ?? 'Aucune note fournie.'),
                 ]);
 
-                // 5. Enregistrement de l'écart de clôture si existant
-                if (abs($difference) > self::FLOAT_TOLERANCE) {
-                    CashOperation::create([
-                        'agency_id'   => $staff->agency_id,
-                        'till_id'     => $lockedTill->id,
-                        'staff_id'    => $staff->id,
-                        'type'        => 'adjustment',
-                        'amount'      => abs($difference),
-                        'description' => $difference > 0
-                            ? "Surplus de caisse constaté à la clôture du guichet [{$lockedTill->code}] d'un montant de " . abs($difference) . " XAF."
-                            : "Manquant de caisse constaté à la clôture du guichet [{$lockedTill->code}] d'un montant de " . abs($difference) . " XAF.",
-                    ]);
-                }
-
-                // 6. Réinitialisation et mise à jour du portefeuille et du guichet
+                // 5. Alignement final des comptes avant fermeture complète
                 $tillWallet->update([
-                    'balance' => $declared
+                    'balance' => $declared // Le solde absorbe le surplus validé par la demande en attente
                 ]);
 
                 $lockedTill->update([
@@ -338,7 +441,7 @@ class CashOperationController extends Controller
                     'current_balance' => $declared,
                 ]);
 
-                // Désassigner également le guichet sur le profil du staff pour libérer sa session
+                // Désassigner le guichet sur le profil du staff pour libérer sa session
                 $staff->update(['till_id' => null]);
 
                 return $operation;
@@ -346,7 +449,7 @@ class CashOperationController extends Controller
 
             return response()->json([
                 'success' => true,
-                'message' => 'Caisse du guichet clôturée et libérée avec succès.',
+                'message' => 'Caisse du guichet clôturée et session libérée avec succès.',
                 'data'    => $closingOperation
             ], 201);
 

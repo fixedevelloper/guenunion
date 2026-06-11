@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Agency;
 use App\Models\CashOperation;
 use App\Models\Commission;
+use App\Models\Country;
 use App\Models\FraudCheck;
 use App\Models\LoginHistory;
 use App\Models\SystemAuditLog;
@@ -33,10 +34,10 @@ class ReportingController extends Controller
     /**
      * Injection du service de reporting global.
      */
-    public function __construct(ReportingService $reportingService,FraudCheckService $fraudCheckService)
+    public function __construct(ReportingService $reportingService, FraudCheckService $fraudCheckService)
     {
         $this->reportingService = $reportingService;
-        $this->fraudService=$fraudCheckService;
+        $this->fraudService = $fraudCheckService;
     }
 
     /**
@@ -56,7 +57,7 @@ class ReportingController extends Controller
 
         return response()->json([
             'success' => true,
-            'data'    => $data
+            'data' => $data
         ], 200);
     }
 
@@ -91,12 +92,12 @@ class ReportingController extends Controller
 
         return response()->json([
             'success' => true,
-            'data'    => $paginated->items(),
-            'meta'    => [
+            'data' => $paginated->items(),
+            'meta' => [
                 'current_page' => $paginated->currentPage(),
-                'last_page'    => $paginated->lastPage(),
-                'per_page'     => $paginated->perPage(),
-                'total'        => $paginated->total(),
+                'last_page' => $paginated->lastPage(),
+                'per_page' => $paginated->perPage(),
+                'total' => $paginated->total(),
             ]
         ], 200);
     }
@@ -148,15 +149,15 @@ class ReportingController extends Controller
                 return response()->json([
                     'success' => true,
                     'data' => [
-                        'session_status'           => 'closed',
-                        'opening_time'             => null,
-                        'currency'                 => $agency->country->currency_code ?? 'XAF',
-                        'current_balance'          => 0.0,
-                        'today_deposits_count'     => 0,
-                        'today_deposits_amount'    => 0.0,
-                        'today_withdrawals_count'  => 0,
+                        'session_status' => 'closed',
+                        'opening_time' => null,
+                        'currency' => $agency->country->currency_code ?? 'XAF',
+                        'current_balance' => 0.0,
+                        'today_deposits_count' => 0,
+                        'today_deposits_amount' => 0.0,
+                        'today_withdrawals_count' => 0,
                         'today_withdrawals_amount' => 0.0,
-                        'recent_logs'              => []
+                        'recent_logs' => []
                     ]
                 ], 200);
             }
@@ -182,7 +183,7 @@ class ReportingController extends Controller
                 ->whereDate('created_at', $today)
                 ->get();
 
-            $cashInToday  = $operationsToday->where('type', 'cash_in');
+            $cashInToday = $operationsToday->where('type', 'cash_in');
             $cashOutToday = $operationsToday->where('type', 'cash_out');
 
             /**
@@ -196,33 +197,33 @@ class ReportingController extends Controller
                     // Détermination comptable dynamique du flux visuel (crédit/débit du coffre)
                     $isCredit = in_array($op->type, ['opening', 'cash_in', 'adjustment']);
                     return [
-                        'id'          => $op->id,
-                        'type'        => $op->type,
-                        'entry_type'  => $isCredit ? 'credit' : 'debit',
-                        'amount'      => (float) $op->amount,
-                        'reference'   => 'OP-' . str_pad($op->id, 7, '0', STR_PAD_LEFT),
+                        'id' => $op->id,
+                        'type' => $op->type,
+                        'entry_type' => $isCredit ? 'credit' : 'debit',
+                        'amount' => (float)$op->amount,
+                        'reference' => 'OP-' . str_pad($op->id, 7, '0', STR_PAD_LEFT),
                         'description' => $op->description,
-                        'time'        => $op->created_at->format('H:i'),
+                        'time' => $op->created_at->format('H:i'),
                     ];
                 })->values();
 
             return response()->json([
                 'success' => true,
                 'data' => [
-                    'session_status'           => $isOpen ? 'open' : 'closed',
-                    'opening_time'             => $isOpen && $lastCycleOp ? $lastCycleOp->created_at->format('H:i') : null,
-                    'currency'                 => $agency->country->currency_code ?? 'XAF',
-                    'current_balance'          => (float) $till->current_balance,
+                    'session_status' => $isOpen ? 'open' : 'closed',
+                    'opening_time' => $isOpen && $lastCycleOp ? $lastCycleOp->created_at->format('H:i') : null,
+                    'currency' => $agency->country->currency_code ?? 'XAF',
+                    'current_balance' => (float)$till->current_balance,
 
                     // Métriques Dépôts / Versements Clients (cash_in)
-                    'today_deposits_count'     => $cashInToday->count(),
-                    'today_deposits_amount'    => (float) $cashInToday->sum('amount'),
+                    'today_deposits_count' => $cashInToday->count(),
+                    'today_deposits_amount' => (float)$cashInToday->sum('amount'),
 
                     // Métriques Retraits Clients (cash_out)
-                    'today_withdrawals_count'  => $cashOutToday->count(),
-                    'today_withdrawals_amount' => (float) $cashOutToday->sum('amount'),
+                    'today_withdrawals_count' => $cashOutToday->count(),
+                    'today_withdrawals_amount' => (float)$cashOutToday->sum('amount'),
 
-                    'recent_logs'              => $recentLogs
+                    'recent_logs' => $recentLogs
                 ]
             ], 200);
 
@@ -262,8 +263,17 @@ class ReportingController extends Controller
         ], 403);
     }
 
-    // 3. Récupération de la Trésorerie Globale du Pays (Corrigé précédemment)
-    $totalWalletBalance = Wallet::where('owner_type', Agency::class)
+    // --- CORRECTION : CALCUL DU TOTAL WALLET BALANCE (Pays + Agences) ---
+
+    // A. Récupération de la balance du portefeuille central du PAYS
+    $countryWalletBalance = Wallet::where('owner_type', Country::class)
+            ->where('owner_id', $country->id)
+            ->where('type', 'main')
+            ->where('is_active', true)
+            ->value('balance') ?? 0;
+
+    // B. Récupération de la Trésorerie Globale des AGENCES du pays
+    $agenciesWalletBalance = Wallet::where('owner_type', Agency::class)
         ->where('type', 'main')
         ->where('is_active', true)
         ->whereHasMorph('owner', [Agency::class], function ($query) use ($country) {
@@ -271,22 +281,28 @@ class ReportingController extends Controller
         })
         ->sum('balance');
 
-$totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Till::class si le wallet appartient au guichet
-->where('type', 'main')
-    ->where('is_active', true)
-    ->whereIn('owner_id', function ($query) use ($country) {
-        $query->select('id')
-            ->from('tills')
-            ->where('is_active', true)
-            ->whereIn('agency_id', function ($subQuery) use ($country) {
-                $subQuery->select('id')
-                    ->from('agencies')
-                    ->where('country_id', $country->id);
-            });
-    })
-    ->sum('balance');
+    // C. Consolidation totale
+    $totalWalletBalance = (float)$countryWalletBalance + (float)$agenciesWalletBalance;
 
-    // 4. ✅ CHARGEMENT EN MASSE OPTIMISÉ ET SÉCURISÉ (Clés explicites)
+    // --- FIN DE LA CORRECTION ---
+
+    // 3. Récupération de l'encaisse physique totale des guichets (Tills) du pays
+    $totalPhysicalCash = Wallet::where('owner_type', 'App\Models\Till')
+        ->where('type', 'main')
+        ->where('is_active', true)
+        ->whereIn('owner_id', function ($query) use ($country) {
+            $query->select('id')
+                ->from('tills')
+                ->where('is_active', true)
+                ->whereIn('agency_id', function ($subQuery) use ($country) {
+                    $subQuery->select('id')
+                        ->from('agencies')
+                        ->where('country_id', $country->id);
+                });
+        })
+        ->sum('balance');
+
+    // 4. Chargement de la synthèse des agences (Relations Eloquent natives préférées aux whereRaw)
     $agencies = Agency::where('country_id', $country->id)
         ->with([
             'wallets' => function ($query) {
@@ -297,25 +313,27 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             }
         ])
         ->withCount([
-            // ✅ Forçage explicite de la clé 'agency_id' pour contourner le bug de détection
             'tills as total_tills_count' => function ($query) {
-                $query->whereRaw('tills.agency_id = agencies.id');
+                $query->where('is_active', true);
             },
-            // Compte les guichets ouverts en vérifiant la dernière opération de caisse
+            // Compte des guichets ouverts basé sur l'état de la dernière opération
             'tills as open_tills_count' => function ($query) {
-                $query->whereRaw('tills.agency_id = agencies.id')
-                    ->where('tills.is_active', true)
+                $query->where('is_active', true)
                     ->whereHas('operations', function ($subQuery) {
-                        // Utilisation d'un alias ou d'une sous-requête propre pour MySQL
-                        $subQuery->whereRaw('cash_operations.id in (select max(co.id) from cash_operations co group by co.till_id)')
-                            ->where('cash_operations.type', 'opening');
+                        $subQuery->whereIn('id', function ($q) {
+                            $q->select(DB::raw('max(id)'))
+                                ->from('cash_operations')
+                                ->groupBy('till_id');
+                        })->where('type', 'opening');
                     });
             }
         ])
-        // Calcule la somme physique des guichets directement en SQL (clé 'agency_id' forcée)
-        ->withSum(['tills as total_till_cash' => function ($query) {
-            $query->whereRaw('tills.agency_id = agencies.id')->where('tills.is_active', true);
-        }], 'current_balance')
+        // Agrégation de la balance du portefeuille des guichets rattachés
+        ->withSum(['wallets as total_till_cash' => function ($query) {
+            $query->where('owner_type', 'App\Models\Till')
+                ->where('type', 'main')
+                ->where('is_active', true);
+        }], 'balance')
         ->get();
 
     // 5. Structuration du tableau de synthèse des agences
@@ -325,7 +343,8 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
 
     foreach ($agencies as $agency) {
         $mainWallet = $agency->wallets->first();
-        $walletBalance = $mainWallet ? (float) $mainWallet->balance : 0.00;
+        $walletBalance = $mainWallet ? (float)$mainWallet->balance : 0.00;
+        $tillCash = (float)($agency->total_till_cash ?? 0);
 
         $totalOpenTillsNetwork += $agency->open_tills_count;
         $totalActiveTillsNetwork += $agency->total_tills_count;
@@ -334,11 +353,11 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             'id'                   => $agency->id,
             'name'                 => $agency->name,
             'code'                 => $agency->code ?? 'AG-' . $agency->id,
-            'total_tills'          => (int) $agency->total_tills_count,
-            'open_tills'           => (int) $agency->open_tills_count,
+            'total_tills'          => (int)$agency->total_tills_count,
+            'open_tills'           => (int)$agency->open_tills_count,
             'wallet_balance'       => $walletBalance,
-            'vault_cash'           => (float) ($agency->total_till_cash ?? 0),
-            'consolidated_balance' => $walletBalance + (float) ($agency->total_till_cash ?? 0),
+            'vault_cash'           => $tillCash,
+            'consolidated_balance' => $walletBalance + $tillCash,
             'status'               => $agency->status ?? 'active'
         ];
     }
@@ -347,20 +366,22 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
     return response()->json([
         'success' => true,
         'data' => [
-            'region_name'          => $country->name,
-            'total_wallet_balance' => (float) $totalWalletBalance,
-            'total_physical_cash'  => (float) $totalPhysicalCash,
-            'active_tills_count'   => $totalActiveTillsNetwork,
-            'open_tills_count'     => $totalOpenTillsNetwork,
-            'agencies_count'       => $agencies->count(),
-            'currency'             => $country->currency_code ?? 'XAF',
+            'region_name'           => $country->name,
+            'country_vault_balance' => (float)$countryWalletBalance, // Ajouté pour transparence sur le front
+            'total_wallet_balance'  => (float)$totalWalletBalance,   // Inclus désormais le solde Pays + Agences
+            'total_physical_cash'   => (float)$totalPhysicalCash,
+            'active_tills_count'    => $totalActiveTillsNetwork,
+            'open_tills_count'      => $totalOpenTillsNetwork,
+            'agencies_count'        => $agencies->count(),
+            'currency'              => $country->currency_code ?? 'XAF',
             'user' => [
                 'name' => trim($user->first_name . ' ' . $user->last_name)
             ],
-            'agencies_summary'     => $agenciesSummary
+            'agencies_summary'      => $agenciesSummary
         ]
     ], 200);
 }
+
     /**
      * Obtenir les indicateurs de performance des agences pour l'administrateur connecté.
      */
@@ -397,16 +418,16 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
                 $activeTillsCount = $agency->staff
                     ->where('is_active', true)
                     ->filter(function ($staff) {
-                        return $staff->user?->hasRole('cashier');
+                        return $staff->user ?->hasRole('cashier');
                     })->count();
 
                 return [
-                    'id'                      => $agency->id,
-                    'uuid'                    => $agency->uuid,
-                    'code'                    => $agency->code,
-                    'name'                    => $agency->name,
-                    'city'                    => $agency->city?->name ?? '—',
-                    'total_cash'              => (float) $totalCash,
+                    'id' => $agency->id,
+                    'uuid' => $agency->uuid,
+                    'code' => $agency->code,
+                    'name' => $agency->name,
+                    'city' => $agency->city ?->name ?? '—',
+                    'total_cash'              => (float)$totalCash,
                     'active_tills_count'      => $activeTillsCount,
                     'total_tills_count'       => $agency->staff->count(),
                     'status'                  => $agency->is_active ? 'active' : 'inactive',
@@ -416,7 +437,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
 
             return response()->json([
                 'success' => true,
-                'data'    => $formatted
+                'data' => $formatted
             ], 200);
 
         } catch (\Exception $e) {
@@ -426,6 +447,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             ], 500);
         }
     }
+
     /**
      * Obtenir l'état de l'intégralité des caisses (Tills) pour le territoire de l'administrateur connecté.
      */
@@ -464,10 +486,10 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
 
                 // Extraction du portefeuille de caisse (type 'till' ou 'cash_drawer')
                 $tillWallet = $cashier->wallets->where('type', 'till')->first();
-                $currentBalance = $tillWallet ? (float) $tillWallet->balance : 0.0;
+                $currentBalance = $tillWallet ? (float)$tillWallet->balance : 0.0;
 
                 // Plafond de sécurité par défaut (ex: 5 000 000 XAF selon les règles d'assurance de l'agence)
-                $maxLimit = $tillWallet && isset($tillWallet->max_limit) ? (float) $tillWallet->max_limit : 5000000.0;
+                $maxLimit = $tillWallet && isset($tillWallet->max_limit) ? (float)$tillWallet->max_limit : 5000000.0;
 
                 // Détermination de l'état de session de la caisse
                 // Idéalement lié à une table 'cashier_sessions'. Exemple dynamique ici :
@@ -477,20 +499,20 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
                 }
 
                 return [
-                    'uuid'            => $tillWallet->uuid ?? $cashier->uuid,
-                    'code'            => $cashier->employee_code ? 'TILL-' . $cashier->employee_code : 'TILL-' . $cashier->id,
-                    'label'           => 'Caisse Guichet — ' . ($cashier->user->last_name ?? 'Agent'),
+                    'uuid' => $tillWallet->uuid ?? $cashier->uuid,
+                    'code' => $cashier->employee_code ? 'TILL-' . $cashier->employee_code : 'TILL-' . $cashier->id,
+                    'label' => 'Caisse Guichet — ' . ($cashier->user->last_name ?? 'Agent'),
                     'current_balance' => $currentBalance,
-                    'status'          => $status, // 'open', 'closed', 'locked'
-                    'cashier_name'    => $cashier->user ? $cashier->user->first_name . ' ' . $cashier->user->last_name : 'Non assigné',
-                    'agency_name'     => $cashier->agency ? $cashier->agency->name : 'Hors-Guichet / Siège',
-                    'max_limit'       => $maxLimit,
+                    'status' => $status, // 'open', 'closed', 'locked'
+                    'cashier_name' => $cashier->user ? $cashier->user->first_name . ' ' . $cashier->user->last_name : 'Non assigné',
+                    'agency_name' => $cashier->agency ? $cashier->agency->name : 'Hors-Guichet / Siège',
+                    'max_limit' => $maxLimit,
                 ];
             });
 
             return response()->json([
                 'success' => true,
-                'data'    => $formattedTills
+                'data' => $formattedTills
             ], 200);
 
         } catch (\Exception $e) {
@@ -500,6 +522,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             ], 500);
         }
     }
+
     /**
      * Centralise et audite le flux de transactions du territoire de l'administrateur connecté.
      */
@@ -557,26 +580,26 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             // 6. Mapping et Normalisation de la charge utile (Payload JSON) pour Next.js
             $formatted = $transactions->map(function ($tx) {
                 return [
-                    'uuid'            => $tx->uuid,
-                    'reference'       => $tx->reference,
-                    'type'            => $tx->type, // Ex: 'cash_in', 'transfer', 'merchant_payment', etc.
-                    'amount'          => (float) $tx->amount,
-                    'fees'            => (float) $tx->fees,
-                    'taxes'           => (float) $tx->taxes,
-                    'currency'        => $tx->currency, // Devise configurée (Default: XAF)
-                    'status'          => $tx->status,   // Ex: 'initiated', 'completed', 'reversed', etc.
-                    'sender_name'     => $tx->sender_name ?? 'Déposit / Système',
-                    'sender_phone'    => $tx->sender_phone,
-                    'receiver_name'   => $tx->recipient_name ?? '—', // Aligné sur votre colonne recipient_name
-                    'receiver_phone'  => $tx->recipient_phone,
-                    'agency_name'     => $tx->sourceAgency ? $tx->sourceAgency->name : 'Hors-Réseau / Distant',
-                    'created_at'      => $tx->created_at->toIso8601String(),
+                    'uuid' => $tx->uuid,
+                    'reference' => $tx->reference,
+                    'type' => $tx->type, // Ex: 'cash_in', 'transfer', 'merchant_payment', etc.
+                    'amount' => (float)$tx->amount,
+                    'fees' => (float)$tx->fees,
+                    'taxes' => (float)$tx->taxes,
+                    'currency' => $tx->currency, // Devise configurée (Default: XAF)
+                    'status' => $tx->status,   // Ex: 'initiated', 'completed', 'reversed', etc.
+                    'sender_name' => $tx->sender_name ?? 'Déposit / Système',
+                    'sender_phone' => $tx->sender_phone,
+                    'receiver_name' => $tx->recipient_name ?? '—', // Aligné sur votre colonne recipient_name
+                    'receiver_phone' => $tx->recipient_phone,
+                    'agency_name' => $tx->sourceAgency ? $tx->sourceAgency->name : 'Hors-Réseau / Distant',
+                    'created_at' => $tx->created_at->toIso8601String(),
                 ];
             });
 
             return response()->json([
                 'success' => true,
-                'data'    => $formatted
+                'data' => $formatted
             ], 200);
 
         } catch (\Exception $e) {
@@ -638,25 +661,25 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             // 5. Mapping pour correspondre exactement aux clés lues par le composant Next.js
             $formatted = $staffCollection->map(function ($staff) {
                 // Récupération du premier rôle attaché à l'utilisateur technique
-                $role = $staff->user?->roles->first();
+                $role = $staff->user ?->roles->first();
 
                 return [
-                    'id'            => $staff->id,
-                    'uuid'          => $staff->uuid,
-                    'name'          => $staff->user ? ($staff->user->first_name . ' ' . $staff->user->last_name) : 'Collaborateur Inconnu',
-                    'email'         => $staff->user?->email ?? '—',
-                    'phone'         => $staff->user?->phone ?? $staff->phone ?? null,
+                    'id' => $staff->id,
+                    'uuid' => $staff->uuid,
+                    'name' => $staff->user ? ($staff->user->first_name . ' ' . $staff->user->last_name) : 'Collaborateur Inconnu',
+                    'email' => $staff->user ?->email ?? '—',
+                    'phone'         => $staff->user ?->phone ?? $staff->phone ?? null,
                     'employee_code' => $staff->employee_code,
-                    'role_name'     => $role?->name ?? 'no_role',
-                    'role_label'    => $role?->title ?? $role?->name ?? 'Non assigné', // Utilisez 'title' ou 'display_name' selon votre package de rôles
-                    'agency_name'   => $staff->agency?->name ?? 'Siège / Hors-Structure',
-                    'is_active'     => (bool) $staff->is_active,
+                    'role_name'     => $role ?->name ?? 'no_role',
+                    'role_label'    => $role ?->title ?? $role ?->name ?? 'Non assigné', // Utilisez 'title' ou 'display_name' selon votre package de rôles
+                    'agency_name'   => $staff->agency ?->name ?? 'Siège / Hors-Structure',
+                    'is_active'     => (bool)$staff->is_active,
                 ];
             });
 
             return response()->json([
                 'success' => true,
-                'data'    => $formatted
+                'data' => $formatted
             ], 200);
 
         } catch (\Exception $e) {
@@ -688,9 +711,15 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             // 3. FILTRE : Par sévérité de score (ex: ?risk_level=high)
             if ($request->filled('risk_level')) {
                 switch ($request->risk_level) {
-                    case 'high':   $query->where('risk_score', '>=', 80); break;
-                    case 'medium': $query->whereBetween('risk_score', [40, 79]); break;
-                    case 'low':    $query->where('risk_score', '<', 40); break;
+                    case 'high':
+                        $query->where('risk_score', '>=', 80);
+                        break;
+                    case 'medium':
+                        $query->whereBetween('risk_score', [40, 79]);
+                        break;
+                    case 'low':
+                        $query->where('risk_score', '<', 40);
+                        break;
                 }
             }
 
@@ -708,7 +737,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             }
 
             // 5. PAGINATION ET TRI (Du plus récent au plus ancien)
-            $perPage = (int) $request->input('per_page', 15);
+            $perPage = (int)$request->input('per_page', 15);
             $checks = $query->orderByDesc('created_at')->paginate($perPage);
 
             // 6. NORMALISATION DES DONNÉES POUR L'UI NEXT.JS
@@ -722,22 +751,22 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
                 }
 
                 return [
-                    'id'            => $check->id,
-                    'uuid'          => $check->uuid,
-                    'risk_score'    => (int) $check->risk_score,
-                    'severity'      => $severity,
-                    'is_flagged'    => (bool) $check->is_flagged,
-                    'is_blocked'    => $check->risk_score >= 80, // Bloqué si score >= 80 selon vos règles
-                    'reason'        => $check->reason,
-                    'date'          => $check->created_at->toIso8601String(),
-                    'transaction'   => $check->transaction ? [
-                        'id'             => $check->transaction->id,
-                        'reference'      => $check->transaction->reference,
-                        'type'           => $check->transaction->type,
-                        'status'         => $check->transaction->status,
-                        'amount'         => (float) $check->transaction->amount,
-                        'currency'       => $check->transaction->currency,
-                        'sender_name'    => $check->transaction->sender_name,
+                    'id' => $check->id,
+                    'uuid' => $check->uuid,
+                    'risk_score' => (int)$check->risk_score,
+                    'severity' => $severity,
+                    'is_flagged' => (bool)$check->is_flagged,
+                    'is_blocked' => $check->risk_score >= 80, // Bloqué si score >= 80 selon vos règles
+                    'reason' => $check->reason,
+                    'date' => $check->created_at->toIso8601String(),
+                    'transaction' => $check->transaction ? [
+                        'id' => $check->transaction->id,
+                        'reference' => $check->transaction->reference,
+                        'type' => $check->transaction->type,
+                        'status' => $check->transaction->status,
+                        'amount' => (float)$check->transaction->amount,
+                        'currency' => $check->transaction->currency,
+                        'sender_name' => $check->transaction->sender_name,
                         'recipient_name' => $check->transaction->recipient_name,
                     ] : null,
                 ];
@@ -747,12 +776,12 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             return response()->json([
                 'success' => true,
                 'message' => 'Registres de contrôle anti-fraude récupérés avec succès.',
-                'data'    => $formattedData,
+                'data' => $formattedData,
                 'pagination' => [
                     'current_page' => $checks->currentPage(),
-                    'last_page'    => $checks->lastPage(),
-                    'total'        => $checks->total(),
-                    'per_page'     => $checks->perPage(),
+                    'last_page' => $checks->lastPage(),
+                    'total' => $checks->total(),
+                    'per_page' => $checks->perPage(),
                 ]
             ], 200);
 
@@ -764,6 +793,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             ], 500);
         }
     }
+
     /**
      * Récupère l'historique des événements et audits système.
      */
@@ -793,35 +823,35 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             }
 
             // 4. PAGINATION AUTOMATIQUE
-            $perPage = (int) $request->input('per_page', 20);
+            $perPage = (int)$request->input('per_page', 20);
             $logs = $query->orderByDesc('created_at')->paginate($perPage);
 
             // 5. NORMALISATION POUR NEXT.JS
             $formattedLogs = collect($logs->items())->map(function ($log) {
                 return [
-                    'id'          => $log->id,
-                    'event_type'  => $log->event_type,
-                    'severity'    => $log->severity,
-                    'message'     => $log->message,
-                    'ip_address'  => $log->ip_address,
-                    'user_agent'  => $log->user_agent,
-                    'payload'     => $log->payload, // Les métadonnées JSON de l'action
-                    'date'        => $log->created_at->toIso8601String(),
-                    'operator'    => $log->user ? [
-                        'username'   => $log->user->username,
-                        'full_name'  => $log->user->first_name . ' ' . $log->user->last_name,
+                    'id' => $log->id,
+                    'event_type' => $log->event_type,
+                    'severity' => $log->severity,
+                    'message' => $log->message,
+                    'ip_address' => $log->ip_address,
+                    'user_agent' => $log->user_agent,
+                    'payload' => $log->payload, // Les métadonnées JSON de l'action
+                    'date' => $log->created_at->toIso8601String(),
+                    'operator' => $log->user ? [
+                        'username' => $log->user->username,
+                        'full_name' => $log->user->first_name . ' ' . $log->user->last_name,
                     ] : null,
-                    'agency_name' => $log->agency?->name ?? 'Système Central',
+                    'agency_name' => $log->agency ?->name ?? 'Système Central',
                 ];
             });
 
             return response()->json([
-                'success'    => true,
-                'data'       => $formattedLogs,
+                'success' => true,
+                'data' => $formattedLogs,
                 'pagination' => [
                     'current_page' => $logs->currentPage(),
-                    'last_page'    => $logs->lastPage(),
-                    'total'        => $logs->total(),
+                    'last_page' => $logs->lastPage(),
+                    'total' => $logs->total(),
                 ]
             ], 200);
 
@@ -862,38 +892,38 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
             }
 
             // 4. PAGINATION ET TRI (Utilisation de created_at décroissant comme configuré dans votre modèle)
-            $perPage = (int) $request->input('per_page', 20);
+            $perPage = (int)$request->input('per_page', 20);
             $logs = $query->orderByDesc('created_at')->paginate($perPage);
 
             // 5. MAPPING ET NORMALISATION DES DONNÉES POUR L'UI NEXT.JS
             $formattedLogs = collect($logs->items())->map(function ($log) {
                 return [
-                    'id'              => $log->id,
+                    'id' => $log->id,
                     'phone_attempted' => $log->phone_attempted,
-                    'ip_address'      => $log->ip_address,
-                    'status'          => $log->status,
-                    'failure_reason'  => $log->failure_reason,
-                    'user_agent'      => $log->user_agent,
-                    'date'            => $log->created_at ? $log->created_at->toIso8601String() : null,
-                    'logged_out_at'   => $log->logged_out_at ? $log->logged_out_at->toIso8601String() : null,
-                    'user'            => $log->user ? [
-                        'id'         => $log->user->id,
-                        'username'   => $log->user->username,
-                        'full_name'  => $log->user->first_name . ' ' . $log->user->last_name,
+                    'ip_address' => $log->ip_address,
+                    'status' => $log->status,
+                    'failure_reason' => $log->failure_reason,
+                    'user_agent' => $log->user_agent,
+                    'date' => $log->created_at ? $log->created_at->toIso8601String() : null,
+                    'logged_out_at' => $log->logged_out_at ? $log->logged_out_at->toIso8601String() : null,
+                    'user' => $log->user ? [
+                        'id' => $log->user->id,
+                        'username' => $log->user->username,
+                        'full_name' => $log->user->first_name . ' ' . $log->user->last_name,
                     ] : null,
-                    'agency_id'       => $log->agency_id, // Utile si vous voulez matcher avec un store d'agences au front
+                    'agency_id' => $log->agency_id, // Utile si vous voulez matcher avec un store d'agences au front
                 ];
             });
 
             // 6. ENVOI DE LA RÉPONSE COMPATIBLE
             return response()->json([
                 'success' => true,
-                'data'    => $formattedLogs,
+                'data' => $formattedLogs,
                 'pagination' => [
                     'current_page' => $logs->currentPage(),
-                    'last_page'    => $logs->lastPage(),
-                    'total'        => $logs->total(),
-                    'per_page'     => $logs->perPage(),
+                    'last_page' => $logs->lastPage(),
+                    'total' => $logs->total(),
+                    'per_page' => $logs->perPage(),
                 ]
             ], 200);
 
@@ -949,10 +979,10 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
 
                         return [
                             'col1' => $com->created_at->format('d/m/Y H:i'),
-                            'col2' => $com->transaction?->reference ?? 'N/A',
+                            'col2' => $com->transaction ?->reference ?? 'N/A',
                 'col3' => $displayName . ($wallet ? " ({$wallet->wallet_number})" : ""),
-                'col4' => number_format($com->transaction?->amount ?? 0) . ' ' . ($com->transaction?->currency ?? 'XAF'),
-                'col5' => number_format($com->amount) . ' ' . ($com->transaction?->currency ?? 'XAF'),
+                'col4' => number_format($com->transaction ?->amount ?? 0) . ' ' . ($com->transaction ?->currency ?? 'XAF'),
+                'col5' => number_format($com->amount) . ' ' . ($com->transaction ?->currency ?? 'XAF'),
             ];
         });
 
@@ -1030,7 +1060,7 @@ $totalPhysicalCash = Wallet::where('owner_type', Till::class) // Corrigé en Til
         return response()->json([
             'success' => true,
             'headers' => $headers,
-            'rows'    => $data
+            'rows' => $data
         ]);
     }
 }

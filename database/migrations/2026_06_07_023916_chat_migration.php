@@ -11,13 +11,19 @@ return new class extends Migration
      */
     public function up(): void
     {
-        // 1. Migration pour les Conversations
+// 1. Table Conversations (Modifiée)
         Schema::create('conversations', function (Blueprint $table) {
             $table->id();
-            // 'peer_to_peer' (Client-Client) ou 'support' (Client-Support)
+            // Types possibles : 'peer_to_peer', 'agent_to_agent', 'agency_group', 'support'
             $table->string('type')->default('peer_to_peer');
-            // 'open' (en cours), 'resolved' (fermé pour le support)
             $table->string('status')->default('open');
+
+            // Relation optionnelle avec l'agence (Utile pour le type 'agency_group')
+            $table->foreignId('agency_id')
+                ->nullable()
+                ->constrained('agencies') // Ajustez le nom de votre table agences si nécessaire
+                ->onDelete('cascade');
+
             $table->timestamps();
         });
 

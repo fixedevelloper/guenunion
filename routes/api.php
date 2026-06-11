@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\AgentChatController;
 use App\Http\Controllers\Api\AgencyAnalyticsController;
 use App\Http\Controllers\Api\AgencyController;
 use App\Http\Controllers\Api\AgencyReportController;
@@ -111,12 +112,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/', [ChatController::class, 'getMyConversations']);
 
     });
+
     /*
      |--------------------------------------------------------------------------
      | Espace Guichet / Caisse (Cashier, Merchant & Administrateurs)
      |--------------------------------------------------------------------------
      */
-    Route::middleware(['role:cashier|merchant|super_admin|country_admin'])->group(function () {
+    Route::middleware(['role:cashier|manager|super_admin|country_admin'])->group(function () {
 
         // Données géographiques de service
         Route::get('/countries', [CountryController::class, 'index']);
@@ -151,6 +153,29 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/cash/transfer/execute', [TransferController::class, 'execute']);
         Route::post('/cash/cash-in/execute', [CashInController::class, 'execute']);
         Route::post('/cash/cash-out/execute', [CashInController::class, 'executeCashOut']);
+
+        Route::prefix('staff/chat/')->group(function () {
+            // Chat P2P entre deux collègues
+            Route::post('peer', [AgentChatController::class, 'startAgentChat']);
+            Route::post('/agents/find-by-phone', [AgentChatController::class, 'findAgentByPhone']);
+            Route::get('/agents', [AgentChatController::class, 'index']);
+            Route::get('/agents/by-country', [AgentChatController::class, 'getAgentsByCountry'])
+                ->name('chat.agents.country');
+            Route::get('/agents/global', [AgentChatController::class, 'getGlobalAgents'])
+                ->name('chat.agents.global');
+            // Salon de discussion de l'agence locale
+            Route::get('agency-channel', [AgentChatController::class, 'getAgencyGroupChat']);
+// 🇨🇲 Salon national (regroupe toutes les agences du pays)
+            Route::get('/country-channel', [AgentChatController::class, 'getCountryGroupChat'])
+                ->name('chat.country');
+
+            // 🌍 Salon global (regroupe absolument tous les agents du système)
+            Route::get('/global-channel', [AgentChatController::class, 'getGlobalGroupChat'])
+                ->name('chat.global');
+            // Pour envoyer et lister les messages, réutilisez les méthodes génériques existantes de votre ChatController :
+            Route::post('conversations/{id}/messages', [ChatController::class, 'sendMessage']);
+            Route::get('conversations/{id}/messages', [ChatController::class, 'getMessages']);
+        });
     });
 
     /*
