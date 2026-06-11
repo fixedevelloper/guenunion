@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\UpdateProfileRequest;
 use App\Models\Customer;
 use App\Models\Transaction;
 use App\Models\TransactionEntry;
@@ -924,6 +925,56 @@ class CustomerController extends Controller
                 'success' => false,
                 'message' => 'Erreur lors de la mise à jour du profil.',
                 'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+    public function updateProfile(UpdateProfileRequest $request): JsonResponse
+    {
+        try {
+            // 1. Récupérer l'utilisateur connecté et son profil client
+            $user = $request->user();
+            $customer = $user->customer; // Supposons la relation HasOne ou BelongsTo
+
+            if (!$customer) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Profil client introuvable."
+                ], 404);
+            }
+
+            // 2. Lancer une transaction pour sécuriser la double mise à jour
+            DB::transaction(function () use ($request, $user, $customer) {
+
+                // Mise à jour de la table 'users'
+                $user->update([
+                    'first_name' => $request->input('first_name'),
+                    'last_name'  => $request->input('last_name'),
+                    'email'      => $request->input('email'),
+                    // Ne pas toucher au numéro de téléphone ici car il est bloqué/lecture seule côté Android
+                ]);
+
+                // Mise à jour de la table 'customers'
+                $customer->update([
+                    'birth_date' => $request->input('birth_date'),
+                    'city_id'    => $request->input('city_id'),
+                ]);
+            });
+
+            // 3. Recharger les relations pour renvoyer un objet tout neuf à Android
+            $customer->load('user');
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Profil mis à jour avec succès.',
+                'data'    => $customer // Correspond au CustomerModel attendu par votre Android Resource.Success
+            ], 200);
+
+        } catch (\Exception $e) {
+            Log::error("Erreur UpdateProfile : " . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Une erreur est survenue lors de la mise à jour du profil.'
             ], 500);
         }
     }

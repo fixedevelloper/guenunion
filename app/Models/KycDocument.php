@@ -26,7 +26,7 @@ class KycDocument extends Model
         'verified_at',
         'verified_by',
     ];
-
+    protected $appends = ['is_verified'];
     /**
      * Obtenir les attributs qui doivent être convertis (Casting).
      *

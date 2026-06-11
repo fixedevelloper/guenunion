@@ -14,6 +14,7 @@ use App\Http\Controllers\Api\CityController;
 use App\Http\Controllers\Api\CommissionController;
 use App\Http\Controllers\Api\CountryController;
 use App\Http\Controllers\Api\customer\ChatController;
+use App\Http\Controllers\Api\customer\KycController;
 use App\Http\Controllers\Api\customer\TransactionController;
 use App\Http\Controllers\Api\customer\WalletController;
 use App\Http\Controllers\Api\CustomerController;
@@ -57,6 +58,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
     // Déconnexion générique
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/auth/me', [AuthController::class, 'me']);
+    Route::post('auth/change-password', [AuthController::class, 'changePassword']);
     /*
      |--------------------------------------------------------------------------
      | Espace Simulation (Accessible par tout le personnel authentifié)
@@ -91,10 +93,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/me/wallets', [WalletController::class, 'index']);
         Route::get('/me/customers/verify/{phone}', [CustomerController::class, 'verifyCustomer']);
         Route::get('/customers/me', [CustomerController::class, 'showMe']);
+        Route::get('me/cities', [CityController::class, 'getCityCustomers']);
         Route::put('/customers/me', [CustomerController::class, 'update']); // PUT ou PATCH selon ta préférence
         Route::get('/me/remittance/estimate-fees', [TransactionController::class, 'estimateFees']);
         Route::post('/me/transactions', [TransactionController::class, 'makeTransaction']);
         Route::post('/me/transfers', [TransactionController::class, 'makeWalletTransaction']);
+        Route::post('/me/profile/update', [CustomerController::class, 'updateProfile']);
+        Route::post('/kyc-documents', [KycController::class, 'upload']);
     });
     // ── 💬 GESTION DES CONVERSATIONS (SALONS) ───────────────────────────────
     Route::prefix('me/conversations')->group(function () {

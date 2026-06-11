@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Helpers\Helpers;
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Auth\ChangePasswordRequest;
 use App\Models\LoginHistory;
 use App\Models\User;
 use App\Models\Staff;
@@ -155,7 +156,7 @@ class AuthController extends Controller
                 'data' => [
                     'access_token' => $token,
                     'token_type'   => 'Bearer',
-                    'customer'     => $customer // Déjà chargé de manière optimale avec 'user' inclus
+                    'customer'     => $customer
                 ]
             ], 200);
 
@@ -538,5 +539,29 @@ class AuthController extends Controller
                 'error'        => $e->getMessage()
             ], 500);
         }
+    }
+    public function changePassword(ChangePasswordRequest $request): JsonResponse
+    {
+        $user = $request->user(); // Récupère l'utilisateur connecté via le Token (Sanctum/Passport)
+
+        // 1. Vérifier si l'ancien mot de passe fourni correspond à celui en BDD
+        if (!Hash::check($request->current_password, $user->password)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Le mot de passe actuel est incorrect.'
+            ], 400); // Code 400 : Bad Request
+        }
+
+        // 2. Mettre à jour le mot de passe (Laravel hash automatiquement via le cast ou manuellement)
+        $user->update([
+            'password' => Hash::make($request->new_password)
+        ]);
+
+        // 3. Réponse standardisée pour correspondre à votre ApiResponse<EmptyResponse> sous Android
+        return response()->json([
+            'success' => true,
+            'message' => 'Votre mot de passe a été modifié avec succès.',
+            'data' => null // Équivalent à l'EmptyResponse attendu par Retrofit
+        ], 200);
     }
 }
