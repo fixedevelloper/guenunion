@@ -14,7 +14,7 @@ class Customer extends Model
 
     protected $fillable = [
         'uuid', 'user_id', 'reference', 'first_name', 'last_name', 'birth_date','id_number','id_expiry_date','id_type',
-        'gender', 'phone_number', 'email', 'country_id', 'city_id', 'address', 'kyc_level', 'status'
+        'gender', 'phone_number', 'email', 'country_id', 'city_id', 'address', 'kyc_level', 'status','transaction_pin'
     ];
 
     protected static function booted()

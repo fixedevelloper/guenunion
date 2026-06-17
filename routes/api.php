@@ -100,6 +100,8 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::post('/me/transfers', [TransactionController::class, 'makeWalletTransaction']);
         Route::post('/me/profile/update', [CustomerController::class, 'updateProfile']);
         Route::post('/kyc-documents', [KycController::class, 'upload']);
+        Route::post('/me/change-pin', [KycController::class, 'changePin']);
+        Route::post('/me/verify-pin', [KycController::class, 'verifyPin']);
     });
     // ── 💬 GESTION DES CONVERSATIONS (SALONS) ───────────────────────────────
     Route::prefix('me/conversations')->group(function () {
